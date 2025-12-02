@@ -1,0 +1,14 @@
+[
+  {
+    "id": "high",
+    "description": "Normen, peer-reviewte Paper, etablierte interne Standards, kalibrierte Messdaten."
+  },
+  {
+    "id": "medium",
+    "description": "Interne Reports, plausible Simulationsergebnisse, Expertenpräsentationen."
+  },
+  {
+    "id": "low",
+    "description": "Internet-Code, unvalidierte Notizen, experimentelle Skripte."
+  }
+]

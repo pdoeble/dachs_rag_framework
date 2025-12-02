@@ -1,0 +1,58 @@
+[
+  {
+    "id": "simulation",
+    "description": "Allgemeine technische Simulation (1D, 3D, Systemsimulation)."
+  },
+  {
+    "id": "gt_power",
+    "description": "Themen rund um GT-Power-Modelle und GT-SUITE."
+  },
+  {
+    "id": "cfd",
+    "description": "Strömungs- und Wärmeübertragungs-Simulation (CFD)."
+  },
+  {
+    "id": "test_driving",
+    "description": "Fahrversuche, Fahrzeugtests auf Straße und Prüfstand."
+  },
+  {
+    "id": "laboratory",
+    "description": "Labormessungen, Prüfstände, Komponentenversuche."
+  },
+  {
+    "id": "component_test",
+    "description": "Komponententests und Validierung einzelner Bauteile."
+  },
+  {
+    "id": "research",
+    "description": "Allgemeine Forschungsthemen, Grundlagenarbeiten."
+  },
+  {
+    "id": "programming",
+    "description": "Programmierung in Python, KNIME, Shell, C/C++, etc."
+  },
+  {
+    "id": "documentation",
+    "description": "Dokumentation, Handbücher, Manuals."
+  },
+  {
+    "id": "guidelines",
+    "description": "Prozess- und Vorgehensrichtlinien."
+  },
+  {
+    "id": "thermodynamics",
+    "description": "Thermodynamik, Wärmeübertragung, Energiehaushalt."
+  },
+  {
+    "id": "combustion",
+    "description": "Verbrennungsprozesse, Brennverfahren."
+  },
+  {
+    "id": "controls",
+    "description": "Regelungstechnik, Steuergeräte, Kalibrierung."
+  },
+  {
+    "id": "hpc",
+    "description": "High Performance Computing, Cluster, SLURM, DACHS-spezifisches."
+  }
+]

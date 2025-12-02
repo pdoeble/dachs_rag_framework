@@ -1,0 +1,82 @@
+[
+  {
+    "id": "textbook",
+    "label": "Textbook / Lehrbuch",
+    "description": "Lehrbuchartige, systematisch aufgebaute Darstellung mit Kapiteln und Übungen."
+  },
+  {
+    "id": "paper",
+    "label": "Scientific paper",
+    "description": "Wissenschaftlicher Fachartikel mit Abstract, Einleitung, Methodik, Ergebnissen."
+  },
+  {
+    "id": "norm",
+    "label": "Norm / Standard",
+    "description": "Formale Normen und Standards, z. B. ISO-, DIN-, OEM-Normen."
+  },
+  {
+    "id": "software_handbook",
+    "label": "Software handbook",
+    "description": "Dokumentation von Software, APIs, GUIs, inkl. Tutorials und Examples."
+  },
+  {
+    "id": "guideline",
+    "label": "Guideline / Richtlinie",
+    "description": "Übergeordnete Richtlinien, Prozesse, Best Practices."
+  },
+  {
+    "id": "best_practice_doc",
+    "label": "Best practice document",
+    "description": "Sammlung bewährter Vorgehensweisen und Lessons Learned."
+  },
+  {
+    "id": "meeting_notice",
+    "label": "Meeting notice / Einladung",
+    "description": "Einladungen und Agenda-Dokumente zu Besprechungen."
+  },
+  {
+    "id": "management_ppt",
+    "label": "Management presentation",
+    "description": "Präsentationen für Management-Ebene (Roadmaps, Entscheidungen)."
+  },
+  {
+    "id": "expert_ppt",
+    "label": "Expert presentation",
+    "description": "Fachlich tiefe Präsentationen für Experten (Berechnungen, Modelle)."
+  },
+  {
+    "id": "code_internal",
+    "label": "Internal code",
+    "description": "Interne Skripte, Tools, Pipelines (Python, KNIME, Shell, etc.)."
+  },
+  {
+    "id": "code_external",
+    "label": "External code",
+    "description": "Externer Beispielcode, Open-Source-Snippets, StackOverflow etc."
+  },
+  {
+    "id": "experiment_supplier_doc",
+    "label": "Supplier experiment documentation",
+    "description": "Versuchs- und Messdokumente von Lieferanten."
+  },
+  {
+    "id": "experiment_internal_doc",
+    "label": "Internal experiment documentation",
+    "description": "Interne Labor- und Versuchsprotokolle."
+  },
+  {
+    "id": "spreadsheet",
+    "label": "Spreadsheet",
+    "description": "Excel- oder ähnliche Tabellen (Kennfelder, Parameterlisten, Messdaten)."
+  },
+  {
+    "id": "lab_report",
+    "label": "Lab report",
+    "description": "Auswertungen von Laborversuchen, inkl. Diagrammen und Diskussion."
+  },
+  {
+    "id": "simulation_report",
+    "label": "Simulation report",
+    "description": "Berichte zu Simulationen (z. B. GT-Power, CFD) mit Ergebnissen und Bewertung."
+  }
+]

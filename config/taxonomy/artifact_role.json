@@ -1,0 +1,38 @@
+[
+  {
+    "id": "measurement_data",
+    "description": "Roh- oder aufbereitete Messdaten."
+  },
+  {
+    "id": "simulation_result",
+    "description": "Ergebnisse aus Simulationen (Plots, Tabellen, Berichte)."
+  },
+  {
+    "id": "test_result",
+    "description": "Resultate aus Fahrversuchen oder Tests."
+  },
+  {
+    "id": "assumption",
+    "description": "Annahmen, Hypothesen, Randbedingungen."
+  },
+  {
+    "id": "target_spec",
+    "description": "Zielwerte, Spezifikationen, Requirements."
+  },
+  {
+    "id": "statement",
+    "description": "Aussagen, Bewertungen, Schlussfolgerungen."
+  },
+  {
+    "id": "test_definition",
+    "description": "Definition und Aufbau von Tests und Versuchen."
+  },
+  {
+    "id": "procedure",
+    "description": "Vorgehens- oder Arbeitsanweisungen, Schrittfolgen."
+  },
+  {
+    "id": "report_summary",
+    "description": "Zusammenfassungen und Management-Summaries."
+  }
+]
