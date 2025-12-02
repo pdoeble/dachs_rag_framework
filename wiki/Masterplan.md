@@ -473,6 +473,42 @@ Um ein konsistentes Arbeiten zu ermöglichen, gelten folgende Konventionen:
 
 ## 5. Themen-Workspaces und Ordnerstrukturen
 
+#### Workspaces sind temporär (Scratch, kein Archiv)
+
+Workspaces sind explizit **temporäre** Bereiche auf schnellen Scratch-Dateisystemen. Sie sind gedacht für:
+
+- laufende Jobs und Jobkampagnen
+- große Zwischenstände (z. B. normalisierte JSONs, Embeddings, Indizes)
+- Experimente, die später konsolidiert oder gelöscht werden
+
+Sie sind **nicht** für langfristige Archivierung gedacht. Jeder Workspace hat eine begrenzte Lebensdauer und wird nach Ablauf entweder automatisch bereinigt oder muss vorher vom Benutzer auf langsamere, dauerhafte Storage-Systeme ausgelagert werden. Die RAG-Pipeline ist daher so konzipiert, dass alle Zwischenergebnisse in Workspaces liegen, aber wichtige Endergebnisse (z. B. trainierte Modelle, finaler QA-Datensatz, „frozen“ Indizes) in ein dauerhaftes Storage verschoben und dort versioniert werden.
+
+#### Gemeinsame Nutzung von Workspaces (optional)
+
+Für gemeinsame Projekte (z. B. mehrere Personen arbeiten an denselben Textkorpora, Indizes oder Modellen) können Group-Workspaces und Sharing genutzt werden:
+
+- `ws_allocate -g <ID> <DAYS>`  
+  legt einen Workspace an, der von Mitgliedern derselben Gruppe gelesen werden kann.
+
+- `ws_allocate -G <group> <ID> <DAYS>`  
+  legt einen Workspace an, der gruppenschreibbar ist (Sticky-Bit, gemeinsamer Schreibzugriff).
+
+Zusätzlich können Workspaces – abhängig vom Dateisystem und ACL-Unterstützung – mit `ws_share` mit einzelnen Benutzern geteilt werden:
+
+```bash
+ws_share share   <workspace> <user>   # Lesezugriff gewähren
+ws_share unshare <workspace> <user>   # Zugriff entziehen
+```
+Für die DACHS-RAG-Pipeline bedeutet das: gesamte Teams können gemeinsame Workspaces für
+
+Korpora (raw/, normalized/, semantic/),
+
+abgeleitete QA-Datensätze (qa_candidates/, qa_final/),
+
+und Indizes (indices/)
+
+nutzen, ohne dass jeder Benutzer eigene Kopien dieser Daten halten muss.
+
 ### 5.1 Übersicht der Workspaces
 
 Für die erste Ausbaustufe werden fünf thematische Workspaces vorgesehen:
