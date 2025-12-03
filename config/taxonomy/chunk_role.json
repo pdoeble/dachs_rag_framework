@@ -1,0 +1,26 @@
+[
+  {
+    "id": "definition",
+    "description": "Formal definition of a concept, quantity or term."
+  },
+  {
+    "id": "derivation",
+    "description": "Mathematical or logical derivation, showing how an equation or relation is obtained."
+  },
+  {
+    "id": "example",
+    "description": "Worked example, numerical calculation or illustrative case demonstrating the use of a concept or equation."
+  },
+  {
+    "id": "exercise",
+    "description": "Task or problem posed to the reader, usually without a full solution in the same chunk."
+  },
+  {
+    "id": "explanation",
+    "description": "Qualitative explanation, interpretation or discussion of concepts, assumptions or results."
+  },
+  {
+    "id": "summary",
+    "description": "Summarizing or concluding text, highlighting the main points of a section or chapter."
+  }
+]
