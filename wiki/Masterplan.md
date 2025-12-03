@@ -218,6 +218,58 @@ Die Lösung besteht aus folgenden Hauptkomponenten:
 
 ## 4. Normierte Datenstrukturen und Namenskonventionen
 
+### Software-Umgebung auf DACHS
+
+**Ziel:** Einheitliche, reproduzierbare Python-Umgebung für alle Skripte und SLURM-Jobs des Projekts.
+
+**Festlegungen:**
+
+- Cluster-Python-Modul: `devel/python/3.12.3-gnu-14.2`
+- Projekt-venv: `~/venv/dachs_rag_312`
+- Projekt-Repo: `~/dachs_rag_framework`
+- Env-Struktur im Repo:
+  - `env/requirements.txt` – zentrale Paketliste
+  - `env/bootstrap_env.sh` – Skript zum Erzeugen/Aktualisieren der Umgebung
+  - `logs/` – Standard-Logverzeichnis für Test- und Arbeitsjobs
+
+**Bootstrap-Skript (einmalig und bei Paketänderungen):**
+
+```bash
+cd ~/dachs_rag_framework
+chmod +x env/bootstrap_env.sh
+./env/bootstrap_env.sh
+```
+Das Skript:
+* lädt devel/python/3.12.3-gnu-14.2,
+* legt ~/venv/dachs_rag_312 an (falls nicht vorhanden),
+* aktualisiert pip, setuptools, wheel,
+* installiert alle Pakete aus env/requirements.txt.
+
+
+Manuelle Aktivierung der Projekt-Umgebung (Shell oder im SLURM-Skript):
+
+```bash
+module purge
+module load devel/python/3.12.3-gnu-14.2
+source "$HOME/venv/dachs_rag_312/bin/activate"
+```
+
+Test-SLURM-Job (CPU/FAISS-Sanity-Check):
+
+```bash
+sbatch env/test_env_cpu.slurm
+```
+
+Der Job prüft:
+
+Python-Version,
+
+Imports von torch, transformers, faiss,
+
+einfachen FAISS-Index-Aufbau + Query.
+
+
+
 ### 4.1 Normalisierte Dokumentstruktur („normalized documents“)
 
 Jedes normalisierte Dokument (oder Chunk) wird im JSON-Format gespeichert. Ein generisches Schema (Beispiel):
