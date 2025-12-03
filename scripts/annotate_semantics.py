@@ -3,32 +3,26 @@
 annotate_semantics.py
 
 Schritt 2 der Pipeline: normalisierte Chunks (normalized/json/*.jsonl)
-werden per LLM (Ollama) semantisch annotiert.
+werden per LLM (Ollama) semantisch annotiert:
 
-Ziele der Anreicherung:
-- Taxonomie-Klassifikation:
-  - content_type   (Liste von IDs aus config/taxonomy/content_type.json)
-  - domain         (Liste von IDs aus config/taxonomy/domain.json)
-  - artifact_role  (Liste von IDs aus config/taxonomy/artifact_role.json)
-  - trust_level    (eine ID aus config/taxonomy/trust_level.json)
-  - chunk_role     (0–2 IDs aus config/taxonomy/chunk_role.json, z.B. definition/derivation/example/…)
-
-- Metadaten:
-  - language       (de/en/mixed/unknown, zusätzlich auch auf oberster Ebene gesetzt)
-
-- Inhaltliche Verdichtung (für Q&A-Generierung):
-  - summary    : kurze technische Zusammenfassung des Chunk-Inhalts
-  - key_facts  : Liste zentraler Aussagen/Formeln/Fakten
-  - tags       : kurze thematische Tags (frei, keine Taxonomie)
-
-Nachbar-Kontext:
-- Für die Klassifikation eines Fokus-Chunks werden optional Ausschnitte
-  aus dem vorherigen und dem nächsten Chunk als Kontext mitgegeben
-  (CONTEXT_BEFORE / CONTEXT_AFTER), um Ableitungen / Definitionen besser
-  zu verstehen. Klassifiziert wird immer nur der Fokus-Chunk.
+- content_type  (Liste von IDs aus config/taxonomy/content_type.json)
+- domain        (Liste von IDs aus config/taxonomy/domain.json)
+- artifact_role (Liste von IDs aus config/taxonomy/artifact_role.json)
+- trust_level   (eine ID aus config/taxonomy/trust_level.json)
+- chunk_role    (optionale pädagogische Rolle des Chunks: definition, example, ...)
+- language      (de/en/mixed/unknown)
 
 Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben,
-nur mit gefülltem "semantic"-Block und ggf. aktualisiertem "language"-Feld.
+nur mit gefülltem "semantic"-Block (und ggf. language aktualisiert).
+
+Zusätzlich:
+- Arbeit wird pro Datei "gestückelt": Input-Dateien werden einzeln abgearbeitet.
+- Wiederaufnahmefähig:
+  - Wenn eine Output-Datei bereits existiert und genauso viele nicht-leere Zeilen
+    wie die Input-Datei hat, wird sie als "fertig" betrachtet und komplett übersprungen.
+  - Wenn das Skript mit bereits annotierten Records (mit semantic.trust_level) als
+    Input läuft, werden diese Records nicht erneut durch das LLM geschickt, sondern
+    nur durchgereicht.
 """
 
 import argparse
@@ -51,6 +45,7 @@ LLM_CONFIG_PATH = REPO_ROOT / "config" / "LLM" / "semantic_llm.json"
 
 
 def load_json_file(path: Path) -> Any:
+    """Hilfsfunktion: JSON-Datei laden oder klarer Fehler."""
     if not path.is_file():
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
     with path.open("r", encoding="utf-8") as f:
@@ -59,25 +54,48 @@ def load_json_file(path: Path) -> Any:
 
 def load_taxonomies() -> Dict[str, List[Dict[str, Any]]]:
     """
-    Lädt alle Taxonomien:
-      - content_type
-      - domain
-      - artifact_role
-      - trust_level
-      - chunk_role
+    Lädt die Taxonomien aus config/taxonomy/*.
+
+    Erwartet mindestens:
+      - content_type.json
+      - domain.json
+      - artifact_role.json
+      - trust_level.json
+
+    Optional:
+      - chunk_role.json
     """
     taxonomies = {
         "content_type": load_json_file(TAXONOMY_DIR / "content_type.json"),
         "domain": load_json_file(TAXONOMY_DIR / "domain.json"),
         "artifact_role": load_json_file(TAXONOMY_DIR / "artifact_role.json"),
         "trust_level": load_json_file(TAXONOMY_DIR / "trust_level.json"),
-        "chunk_role": load_json_file(TAXONOMY_DIR / "chunk_role.json"),
     }
+
+    chunk_role_path = TAXONOMY_DIR / "chunk_role.json"
+    if chunk_role_path.is_file():
+        taxonomies["chunk_role"] = load_json_file(chunk_role_path)
+    else:
+        taxonomies["chunk_role"] = []
+
     return taxonomies
 
 
 def extract_ids(tax_list: List[Dict[str, Any]]) -> List[str]:
+    """Extrahiert alle 'id'-Felder aus einer Taxonomie-Liste."""
     return [str(entry["id"]) for entry in tax_list if "id" in entry]
+
+
+def count_nonempty_lines(path: Path) -> int:
+    """Zählt nicht-leere Zeilen in einer Datei (für Resume-Check auf Dateiebene)."""
+    if not path.is_file():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -86,15 +104,7 @@ def extract_ids(tax_list: List[Dict[str, Any]]) -> List[str]:
 
 class LLMSemanticClassifier:
     """
-    Kapselt den Zugriff auf das Ollama-/api/chat-Interface.
-
-    Konfig-Parameter (semantic_llm.json):
-      - endpoint          : Basis-URL (z.B. "http://localhost:11434")
-      - model             : Modell-ID (z.B. "llama3.1:8b")
-      - temperature       : Sampling-Temperatur
-      - max_tokens        : (aktuell nur informativ, da Ollama das selbst handhabt)
-      - max_chars         : max. Anzahl Zeichen des Fokus-Chunks
-      - max_context_chars : max. Anzahl Zeichen je Kontext-Snippet (vorher/nachher)
+    Dünner Wrapper um Ollama /api/chat für unsere Klassifikationsaufgabe.
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -104,13 +114,13 @@ class LLMSemanticClassifier:
         if not str(base).startswith("http"):
             base = f"http://{base}"
         self.base_url = str(base).rstrip("/")
+
         self.model = config.get("model", "llama3.1:8b")
         self.temperature = float(config.get("temperature", 0.0))
-        self.max_tokens = int(config.get("max_tokens", 256))
-        # max_chars begrenzt den übergebenen Fokus-Chunk
+        # max_tokens -> num_predict bei Ollama (Antwortlänge)
+        self.max_tokens = int(config.get("max_tokens", 512))
+        # Sicherheits-Limit für Chunk-Textlänge (in Zeichen)
         self.max_chars = int(config.get("max_chars", 4000))
-        # separate Begrenzung für Kontext vor/nach dem Chunk
-        self.max_context_chars = int(config.get("max_context_chars", 800))
 
     def classify_chunk(
         self,
@@ -123,43 +133,31 @@ class LLMSemanticClassifier:
         """
         Ruft das LLM auf und erwartet ein reines JSON-Objekt als Antwort.
 
-        Erwartete Felder in der Antwort:
-          - language: string ("de"/"en"/"mixed"/"unknown")
-          - content_type: list[str] (Taxonomie-IDs)
-          - domain: list[str] (Taxonomie-IDs)
-          - artifact_role: list[str] (Taxonomie-IDs)
-          - trust_level: string (Taxonomie-ID)
-          - chunk_role: list[str] (Taxonomie-IDs)
-          - summary: string (kurze technische Zusammenfassung)
-          - key_facts: list[str] (zentrale Aussagen/Formeln/Fakten)
-          - tags: list[str] (kurze thematische Tags, frei)
-
-        prev_text / next_text:
-          - optionale Ausschnitte aus vorherigem / nächstem Chunk
-          - dienen nur als Kontext, klassifiziert wird ausschließlich der Fokus-Chunk
+        prev_text / next_text: Nachbar-Chunks als Kontext (optional).
         """
         if not text:
             return None
 
-        # Fokus-Chunk hart beschneiden
+        # Haupt-Text ggf. hart beschneiden
         if len(text) > self.max_chars:
             text = text[: self.max_chars]
 
-        # Kontext-Snippets begrenzen
-        ctx_before = ""
-        if prev_text:
-            prev_text = str(prev_text)
-            ctx_before = prev_text[-self.max_context_chars :]
+        # Nachbar-Kontext leicht beschneiden, damit der Prompt nicht explodiert
+        def _clip_neighbor(s: Optional[str], max_len: int = 1000) -> Optional[str]:
+            if not s:
+                return None
+            s = s.strip()
+            if len(s) <= max_len:
+                return s
+            return s[:max_len]
 
-        ctx_after = ""
-        if next_text:
-            next_text = str(next_text)
-            ctx_after = next_text[: self.max_context_chars]
+        prev_text = _clip_neighbor(prev_text)
+        next_text = _clip_neighbor(next_text)
 
-        # IDs und optionale Beschreibungen für den Prompt vorbereiten
+        # IDs + optionale Beschreibungen für den Prompt vorbereiten
         def fmt_list(name: str) -> str:
             items = []
-            for entry in taxonomies[name]:
+            for entry in taxonomies.get(name, []):
                 _id = entry.get("id")
                 desc = entry.get("description", "")
                 label = entry.get("label", "")
@@ -167,41 +165,45 @@ class LLMSemanticClassifier:
                     items.append(f'- "{_id}": {label} – {desc}')
                 else:
                     items.append(f'- "{_id}": {desc}')
-            return "\n".join(items)
+            return "\n".join(items) if items else "(none)"
 
         content_type_block = fmt_list("content_type")
         domain_block = fmt_list("domain")
         artifact_role_block = fmt_list("artifact_role")
         trust_level_block = fmt_list("trust_level")
-        chunk_role_block = fmt_list("chunk_role")
+        chunk_role_block = fmt_list("chunk_role") if taxonomies.get("chunk_role") else ""
 
         system_prompt = (
-            "You are a precise classifier and summarizer for technical engineering documents "
-            "(thermodynamics, simulations, experiments, HPC, GT-Power, documentation).\n"
-            "Your job is to:\n"
-            "  (1) assign semantic tags from a fixed taxonomy and\n"
-            "  (2) extract a short technical summary and key facts for Q&A generation.\n\n"
-            "You MAY use CONTEXT_BEFORE and CONTEXT_AFTER to better understand the position of "
-            "the focus chunk in a derivation or section, but you MUST classify only the FOCUS_CHUNK.\n\n"
+            "You are a precise classifier for technical engineering documents "
+            "(thermodynamics, simulations, experiments, HPC, GT-Power, documentation). "
+            "Your job is to assign semantic tags from a fixed taxonomy.\n\n"
             "You MUST respond with a single JSON object only. No explanations, "
             "no markdown, no surrounding text."
         )
 
-        # Kontextblöcke nur einfügen, wenn vorhanden
-        ctx_before_block = f'CONTEXT_BEFORE (optional, previous chunk):\n\"\"\"{ctx_before}\"\"\"\n\n' if ctx_before else ""
-        ctx_after_block = f'CONTEXT_AFTER  (optional, next chunk):\n\"\"\"{ctx_after}\"\"\"\n\n' if ctx_after else ""
-
+        # Basis-User-Prompt
         user_prompt = f"""
-We have a FOCUS_CHUNK from a larger document.
+We have a text CHUNK from a larger document.
 
 Document title: "{doc_title}"
 
-{ctx_before_block}FOCUS_CHUNK (this is what you must classify and summarize):
+MAIN CHUNK TEXT:
 \"\"\"{text}\"\"\"
+"""
 
-{ctx_after_block}TASK 1: CLASSIFICATION
+        # Nachbar-Kontext optional einfügen
+        if prev_text or next_text:
+            user_prompt += "\nNEIGHBORING CONTEXT (for orientation, do NOT classify these separately):\n"
+            if prev_text:
+                user_prompt += f'\n[PREVIOUS CHUNK]:\n\"\"\"{prev_text}\"\"\"\n'
+            if next_text:
+                user_prompt += f'\n[NEXT CHUNK]:\n\"\"\"{next_text}\"\"\"\n'
 
-Classify this FOCUS_CHUNK according to the following taxonomy. Use ONLY IDs from the lists.
+        user_prompt += """
+
+TASK:
+Classify ONLY the MAIN CHUNK according to the following taxonomy.
+Use ONLY IDs from the lists. If nothing clearly fits, use empty lists.
 
 Allowed values:
 
@@ -212,75 +214,55 @@ Allowed values:
    - "unknown" : cannot be determined
 
 2) content_type (0–2 items from this list):
-{content_type_block}
+""" + content_type_block + """
 
 3) domain (0–3 items from this list):
-{domain_block}
+""" + domain_block + """
 
 4) artifact_role (0–3 items from this list):
-{artifact_role_block}
+""" + artifact_role_block + """
 
 5) trust_level (exactly ONE item from this list):
-{trust_level_block}
+""" + trust_level_block + """
+"""
 
-6) chunk_role (0–2 items from this list):
-   Use this to describe the pedagogical role of the FOCUS_CHUNK.
-{chunk_role_block}
+        if chunk_role_block:
+            user_prompt += """
 
+6) chunk_role (0–2 items from this list, pedagogical function of the MAIN CHUNK):
+""" + chunk_role_block + """
+"""
 
-TASK 2: SEMANTIC ENRICHMENT FOR Q&A
+        # Output-Schema
+        user_prompt += """
 
-Based on the same FOCUS_CHUNK:
-
-7) summary:
-   - Provide a short technical summary (1–3 sentences),
-   - Focus on the main idea, not on page layout or file paths.
-
-8) key_facts:
-   - Provide a list (array) of 3–8 short key facts,
-   - Each entry should be a self-contained statement or formula that could be used
-     to create technical Q&A questions (e.g. definitions, derived equations,
-     parameter relationships, qualitative statements).
-
-9) tags:
-   - Provide 2–6 short topic tags (free text, not from taxonomy),
-   - Use concise, technical phrases in English, e.g. "equation_of_state",
-     "van_der_waals", "critical_point", "compressibility_factor".
-
-
-OUTPUT FORMAT (STRICT):
-
+OUTPUT FORMAT:
 Return EXACTLY one JSON object with keys:
   "language": string,
   "content_type": list of strings,
   "domain": list of strings,
   "artifact_role": list of strings,
-  "trust_level": string,
-  "chunk_role": list of strings,
-  "summary": string,
-  "key_facts": list of strings,
-  "tags": list of strings
+  "trust_level": string
+"""
+
+        if chunk_role_block:
+            user_prompt += '  "chunk_role": list of strings\n'
+
+        user_prompt += """
 
 Example (schema only, NOT the real answer):
-{{
-  "language": "en",
+{
+  "language": "de",
   "content_type": ["textbook"],
   "domain": ["thermodynamics"],
   "artifact_role": ["statement"],
-  "trust_level": "high",
-  "chunk_role": ["derivation"],
-  "summary": "Short technical summary of what this chunk explains.",
-  "key_facts": [
-    "First key fact in one sentence.",
-    "Second key fact or important equation.",
-    "Third key fact about assumptions or limitations."
-  ],
-  "tags": ["equation_of_state", "critical_point", "compressibility_factor"]
-}}
+  "trust_level": "high"
+}
 
-Now produce the JSON classification and enrichment for the FOCUS_CHUNK.
+Now produce the JSON classification for the MAIN CHUNK.
 """
 
+        # Ollama-Payload mit JSON-Mode + num_predict
         payload = {
             "model": self.model,
             "messages": [
@@ -289,6 +271,10 @@ Now produce the JSON classification and enrichment for the FOCUS_CHUNK.
             ],
             "temperature": self.temperature,
             "stream": False,
+            "format": "json",  # zwingt das Modell, valides JSON auszugeben
+            "options": {
+                "num_predict": self.max_tokens,  # genug Platz, damit JSON nicht abgeschnitten wird
+            },
         }
 
         url = self.base_url + "/api/chat"
@@ -307,15 +293,17 @@ Now produce the JSON classification and enrichment for the FOCUS_CHUNK.
             logging.error("Failed to parse LLM JSON response: %s", e)
             return None
 
-        # Robust: ggf. JSON aus Text "herausziehen"
         return self._safe_parse_json(content)
 
     @staticmethod
     def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
+        """
+        Robustheitsschicht: versucht, aus einem Text ein Dict zu parsen.
+        (inkl. Fällen, wo das Modell fälschlich ```json ... ``` drumherum packt.)
+        """
         text = text.strip()
         # Falls Modell blöderweise ```json ... ``` liefert
         if text.startswith("```"):
-            # alles zwischen erster "{" und letzter "}" nehmen
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -348,59 +336,48 @@ Now produce the JSON classification and enrichment for the FOCUS_CHUNK.
 # Semantik anwenden / Validierung gegen Taxonomie
 # ---------------------------------------------------------------------------
 
-def _as_list_of_str(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(v) for v in value if str(v).strip()]
-    return []
-
-
 def normalize_semantic_result(
     raw: Dict[str, Any],
     taxonomies: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
     """
-    Filtert und normalisiert die LLM-Ausgabe gegen die Taxonomien und
-    begrenzt Listenlängen.
+    Filtert und normalisiert die LLM-Ausgabe gegen die Taxonomien.
 
-    Rückgabeformat:
-      {
-        "language": str,
-        "content_type": list[str],
-        "domain": list[str],
-        "artifact_role": list[str],
-        "trust_level": str,
-        "chunk_role": list[str],
-        "summary": str,
-        "key_facts": list[str],
-        "tags": list[str],
-      }
+    - entfernt unbekannte IDs
+    - enforced Sprach-Werte
+    - begrenzt Listengrößen
     """
     allowed_content_type = set(extract_ids(taxonomies["content_type"]))
     allowed_domain = set(extract_ids(taxonomies["domain"]))
     allowed_artifact_role = set(extract_ids(taxonomies["artifact_role"]))
     allowed_trust_level = set(extract_ids(taxonomies["trust_level"]))
-    allowed_chunk_role = set(extract_ids(taxonomies["chunk_role"]))
+    allowed_chunk_role = set(extract_ids(taxonomies.get("chunk_role", [])))
 
-    # Sprache
+    def as_list(value) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return []
+
+    # Sprache normieren
     language = str(raw.get("language", "unknown")).lower()
     if language not in {"de", "en", "mixed", "unknown"}:
         language = "unknown"
 
-    # Taxonomie-Listen
-    ct = [v for v in _as_list_of_str(raw.get("content_type")) if v in allowed_content_type]
-    dom = [v for v in _as_list_of_str(raw.get("domain")) if v in allowed_domain]
-    ar = [v for v in _as_list_of_str(raw.get("artifact_role")) if v in allowed_artifact_role]
-    cr = [v for v in _as_list_of_str(raw.get("chunk_role")) if v in allowed_chunk_role]
+    # Taxonomie-Listen filtern
+    ct = [v for v in as_list(raw.get("content_type")) if v in allowed_content_type]
+    dom = [v for v in as_list(raw.get("domain")) if v in allowed_domain]
+    ar = [v for v in as_list(raw.get("artifact_role")) if v in allowed_artifact_role]
+    cr = [v for v in as_list(raw.get("chunk_role")) if v in allowed_chunk_role]
 
-    # trust_level
+    # trust_level: genau eins, sonst Fallback
     tl_raw = str(raw.get("trust_level", "")).strip()
     trust = tl_raw if tl_raw in allowed_trust_level else None
     if trust is None:
-        # Fallback: medium, falls vorhanden, sonst erster Eintrag
+        # Fallback: "medium", falls vorhanden, sonst erster Eintrag
         if "medium" in allowed_trust_level:
             trust = "medium"
         else:
@@ -412,28 +389,6 @@ def normalize_semantic_result(
     ar = ar[:3]
     cr = cr[:2]
 
-    # Summary
-    summary = raw.get("summary", "")
-    if summary is None:
-        summary = ""
-    if not isinstance(summary, str):
-        summary = str(summary)
-    summary = summary.strip()
-    # Hard limit, um Ausreißer einzufangen
-    if len(summary) > 2000:
-        summary = summary[:2000]
-
-    # key_facts
-    key_facts = _as_list_of_str(raw.get("key_facts"))
-    # Leerzeilen entfernen und hart begrenzen
-    key_facts = [kf.strip() for kf in key_facts if kf.strip()]
-    key_facts = key_facts[:10]
-
-    # tags
-    tags = _as_list_of_str(raw.get("tags"))
-    tags = [t.strip() for t in tags if t.strip()]
-    tags = tags[:10]
-
     return {
         "language": language,
         "content_type": ct,
@@ -441,9 +396,6 @@ def normalize_semantic_result(
         "artifact_role": ar,
         "trust_level": trust,
         "chunk_role": cr,
-        "summary": summary,
-        "key_facts": key_facts,
-        "tags": tags,
     }
 
 
@@ -458,14 +410,20 @@ def process_file(
     taxonomies: Dict[str, List[Dict[str, Any]]],
 ) -> None:
     """
-    Liest alle Records einer JSONL-Datei in eine Liste, damit für jeden
-    Fokus-Chunk optional der vorherige und nächste Chunk als Kontext
-    mitgegeben werden kann.
+    Liest eine JSONL-Datei, annotiert jeden Chunk mit LLM und schreibt
+    eine neue JSONL-Datei.
+
+    - Wir laden erst alle Records in eine Liste, um prev/next-Text
+      mitgeben zu können.
+    - Wiederaufnahme auf Record-Ebene:
+      Falls ein Record bereits ein semantic-Objekt mit trust_level besitzt,
+      wird er nicht erneut durch das LLM geschickt, sondern direkt
+      in die Output-Datei geschrieben.
     """
     logging.info("Verarbeite %s → %s", in_path.name, out_path.name)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1) gesamte Datei einlesen und JSON dekodieren
+    # 1) komplette Datei einlesen
     records: List[Dict[str, Any]] = []
     with in_path.open("r", encoding="utf-8") as fin:
         for line in fin:
@@ -480,24 +438,37 @@ def process_file(
             records.append(rec)
 
     total = len(records)
+    if total == 0:
+        logging.warning("Keine gültigen Records in %s", in_path)
+        out_path.write_text("", encoding="utf-8")
+        return
+
     annotated = 0
 
-    # 2) über alle Records iterieren, mit Index für Kontext
+    # 2) mit Nachbar-Kontext annotieren und direkt wegschreiben
     with out_path.open("w", encoding="utf-8") as fout:
         for idx, rec in enumerate(records):
+            # Wiederaufnahme-Check auf Record-Ebene:
+            # Wenn semantic.trust_level bereits gesetzt ist, nicht erneut LLM-Aufruf.
+            sem_existing = rec.get("semantic") or {}
+            already_annotated = isinstance(sem_existing, dict) and bool(sem_existing.get("trust_level"))
+
+            if already_annotated:
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                continue
+
             content = rec.get("content", "")
             title = rec.get("title", "") or rec.get("doc_id", "")
 
-            # Nachbar-Kontext vorbereiten
-            prev_content = records[idx - 1].get("content", "") if idx > 0 else None
-            next_content = records[idx + 1].get("content", "") if idx + 1 < total else None
+            prev_text = records[idx - 1]["content"] if idx > 0 else None
+            next_text = records[idx + 1]["content"] if idx + 1 < total else None
 
             llm_raw = classifier.classify_chunk(
-                content,
-                title,
-                taxonomies,
-                prev_text=prev_content,
-                next_text=next_content,
+                text=content,
+                doc_title=title,
+                taxonomies=taxonomies,
+                prev_text=prev_text,
+                next_text=next_text,
             )
 
             if llm_raw is None:
@@ -512,7 +483,7 @@ def process_file(
             if not lang_existing or lang_existing == "unknown":
                 rec["language"] = semantic["language"]
 
-            # semantic-Block im Record aktualisieren / erweitern
+            # semantic-Block im Record aktualisieren
             sem_block = rec.get("semantic") or {}
             sem_block.update(
                 {
@@ -520,28 +491,32 @@ def process_file(
                     "domain": semantic["domain"],
                     "artifact_role": semantic["artifact_role"],
                     "trust_level": semantic["trust_level"],
-                    "chunk_role": semantic["chunk_role"],
-                    "summary": semantic["summary"],
-                    "key_facts": semantic["key_facts"],
-                    "tags": semantic["tags"],
                 }
             )
+            # chunk_role nur schreiben, wenn Taxonomie existiert
+            if taxonomies.get("chunk_role"):
+                sem_block["chunk_role"] = semantic["chunk_role"]
+
             rec["semantic"] = sem_block
 
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             annotated += 1
 
     logging.info(
-        "Fertig: %s (Chunks gesamt: %d, annotiert: %d)",
+        "Fertig: %s (Chunks gesamt: %d, neu annotiert: %d)",
         in_path.name,
         total,
         annotated,
     )
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Semantische Anreicherung normalisierter JSONL-Chunks per LLM (Ollama), inkl. Nachbar-Kontext und chunk_role."
+        description="Semantische Anreicherung normalisierter JSONL-Chunks per LLM (Ollama)."
     )
     parser.add_argument(
         "--input-dir",
@@ -606,9 +581,32 @@ def main() -> None:
         logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
         return
 
+    # Arbeit stückeln + Wiederaufnahme auf Dateiebene:
+    # Wenn Output-Datei existiert und die gleiche Anzahl nicht-leerer Zeilen wie
+    # die Input-Datei hat, wird diese Datei komplett übersprungen.
     for in_file in files:
         rel = in_file.name
         out_file = output_dir / rel
+
+        if out_file.exists():
+            in_lines = count_nonempty_lines(in_file)
+            out_lines = count_nonempty_lines(out_file)
+            if in_lines > 0 and in_lines == out_lines:
+                logging.info(
+                    "Überspringe %s, bereits vollständig annotiert (%d Chunks).",
+                    in_file.name,
+                    in_lines,
+                )
+                continue
+            else:
+                logging.warning(
+                    "Output-Datei %s existiert, aber Zeilenzahl passt nicht "
+                    "(input=%d, output=%d). Datei wird neu geschrieben.",
+                    out_file.name,
+                    in_lines,
+                    out_lines,
+                )
+
         process_file(in_file, out_file, classifier, taxonomies)
 
     logging.info("Semantische Anreicherung abgeschlossen.")
