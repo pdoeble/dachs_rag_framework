@@ -269,27 +269,30 @@ Imports von torch, transformers, faiss,
 einfachen FAISS-Index-Aufbau + Query.
 
 
-
-### 4.1 Normalisierte Dokumentstruktur („normalized documents“)
+## 4.1 Normalisierte Dokumentstruktur („normalized documents“)
 
 Jedes normalisierte Dokument (oder Chunk) wird im JSON-Format gespeichert. Ein generisches Schema (Beispiel):
 
 ```json
 {
   "doc_id": "tp_textbook_2019_01",
-  "chunk_id": "tp_textbook_2019_01_ch2_sec3_par5",
+  "chunk_id": "tp_textbook_2019_01_c0005",
   "source_type": "pdf",
   "source_path": "raw/textbooks/thermo/textbook_2019_01.pdf",
   "title": "2.3 Heat Transfer in Cooling Systems",
   "language": "en",
   "content": "Here we describe the fundamentals of heat transfer relevant for cooling system design...",
   "meta": {
-    "workspace": "Thermodynamics_Textbooks",
     "page_start": 45,
-    "page_end": 46,
-    "created_at": "2025-12-01",
+    "page_end": 48,
+    "num_pages": 870,
+    "block_types": ["heading", "paragraph", "formula"],
+    "has_table": false,
+    "has_formula": true,
+    "has_heading": true,
     "tags": ["cooling_system", "heat_transfer"]
-  }
+  },
+  "semantic": {}
 }
 ```
 
@@ -301,19 +304,31 @@ Pflichtfelder:
 - `source_path`: Pfad im thematischen Workspace (z. B. `raw/textbooks/…`).
 - `content`: extrahierter Text (oder serialisierte Struktur z. B. für Tabellen/Code).
 - `language`: Primärsprache des Chunks (`"de"`, `"en"`, `"mixed"`).
-- `meta`: Objekt für zusätzliche Metadaten (Workspace, Datum, Seiten, Tags usw.).
+- `meta`: Objekt für zusätzliche Metadaten (Seiten, Blocktypen, Tags usw.).
+- `semantic`: Objekt für semantische Annotationen (wird in Schritt 2 der Pipeline gefüllt).
+
+Typische `meta`-Felder bei PDFs:
+
+- `page_start`, `page_end`: 0-basierter Seitenbereich des Chunks.
+- `num_pages`: Gesamtseitenzahl des Ursprungsdokuments.
+- `block_types`: Menge der im Chunk vorkommenden Blocktypen, z. B. `["paragraph", "formula", "table"]`.
+- `has_table`, `has_formula`, `has_heading`: schnelle Booleans zur Filterung.
+- optionale Felder wie `tags`, `created_at`, `workspace` usw. je nach Workspace.
 
 Chunks werden je nach Dateityp nach sinnvollen Einheiten geschnitten, z. B.:
 
-- PDFs: Kapitel/Abschnitte/Paragrafen oder Seitenbereiche.
-- PowerPoints: einzelne Folien (`slide_id`).
-- Excel: Tabellen/Sheets + ggf. Zeilen-/Spaltenbereiche.
-- Code: Dateien + Funktionen/Blöcke.
-- Protokolle: Abschnitte nach Datum/Agenda.
+- **PDFs**: satzbasiertes Chunking mit:
+  - Entfernung wiederkehrender Kopf-/Fußzeilen,
+  - Heuristiken für Überschriften (`heading`), Tabellen (`table`) und Formeln (`formula`),
+  - Chunks aus aufeinanderfolgenden Sätzen bis zu einer Zielgröße (z. B. ~6000 Zeichen),
+  - kleinen Satz-Overlaps zwischen Chunks (1–2 Sätze), um Kontext an Chunk-Grenzen zu erhalten.
+- **PowerPoints**: einzelne Folien (`slide_id`) bzw. logisch zusammengehörige Foliengruppen.
+- **Excel**: Tabellen/Sheets plus ggf. Zeilen-/Spaltenbereiche.
+- **Code**: Dateien plus Funktionen/Blöcke.
+- **Protokolle/Logs**: Abschnitte nach Datum/Agenda.
 
-Das Schema der Felder bleibt für alle Dateitypen gleich, damit spätere Schritte (Semantik, Q/A, Embeddings) generisch implementiert werden können.
+Das Schema der Felder bleibt für alle Dateitypen gleich, damit nachgelagerte Schritte (Semantik, Q/A, Embeddings) generisch implementiert werden können.
 
----
 
 ### 4.2 Metadaten-Schema
 
@@ -765,35 +780,55 @@ Empfehlungen:
 
 ## 6. Verarbeitungspipeline: Schritte und Skripte
 
-### 6.1 Schritt 1: Ingestion & Normalisierung
+## 6.1 Schritt 1: Ingestion & Normalisierung
 
-Ziele:
+**Ziele:**
 
 - Einlesen aller relevanten Dateien aus `raw/`.
 - Typabhängige Extraktion von Text/Struktur.
 - Schreiben normalisierter JSON-Dokumente nach `normalized/json/`.
 
-Typische Skripte:
+**Typische Skripte:**
 
-- `ingest_pdfs.py`
-- `ingest_pptx.py`
-- `ingest_xlsx.py`
-- `ingest_docx.py`
-- `ingest_code.py`
+- `scripts/ingest_pdfs.py`
+- `scripts/ingest_pptx.py`
+- `scripts/ingest_xlsx.py`
+- `scripts/ingest_docx.py`
+- `scripts/ingest_code.py`
 
-Diese Skripte:
+**Verhalten von `ingest_pdfs.py` (konkret umgesetzt):**
 
-- erhalten als Eingangsparameter:
-  - `--workspace-root` (Pfad zum Workspace),
-  - optional Filter (z. B. nur bestimmte Unterordner oder Dateitypen).
-- finden relevante Dateien im `raw/`-Baum,
-- erzeugen pro Datei oder Chunk passende `doc_id`/`chunk_id`,
-- schreiben JSON-Objekte in `normalized/json/` (z. B. als einzelne Dateien oder als JSONL-Batches).
+- Extrahiert Text seitenweise mit `pypdf`.
+- Entfernt wiederkehrende Kopf- und Fußzeilen heuristisch (Seitenüberschriften, Seitennummern, etc.).
+- Zerlegt jede Seite in Zeilen und Sätze.
+- Klassifiziert jede Zeile grob in Blocktypen:
+  - `heading` (Kapitel-/Abschnittstitel),
+  - `table` (Tabellenzeilen mit typischer Spaltenstruktur),
+  - `formula` (Zeilen mit Gleichungen/typischen Mathe-Symbolen),
+  - `paragraph` (normaler Fließtext).
+- Baut Chunks als Sequenz von Sätzen:
+  - Schneidet **nur an Satzgrenzen**.
+  - Zielt auf eine maximale Chunkgröße (Default: `--max-chars 6000`).
+  - Fügt eine kleine Satz-Überlappung zwischen Chunks ein (Default: `--sentence-overlap 2`).
+  - Verhindert Mikro-Chunks am Dokumentende mit einem `--min-chars`-Schwellwert (Default: 400).
+  - Erzwingt Chunkgrenzen an Überschriften, soweit sinnvoll.
+- Schreibt pro PDF **eine JSONL-Datei** nach `normalized/json/`, in der jede Zeile ein Chunk ist.
+- Füllt `meta.page_start`, `meta.page_end`, `meta.num_pages`, `meta.block_types`, `meta.has_table`, `meta.has_formula`, `meta.has_heading`.
 
-Ausführung:
+**CLI-Schnittstelle (aktueller Stand `ingest_pdfs.py`):**
 
-- Kleine Tests interaktiv (z. B. in einer Jupyter-Session auf DACHS).
-- Produktiv über SLURM-Batch-Jobs (z. B. pro Workspace oder pro Dateityp getrennt).
+```bash
+python scripts/ingest_pdfs.py   --input-dir  /beegfs/scratch/workspace/<workspace-name>/raw   --output-dir /beegfs/scratch/workspace/<workspace-name>/normalized/json   --max-chars 6000   --min-chars 400   --sentence-overlap 2   --verbose
+```
+
+- `--input-dir`: Wurzelverzeichnis der Rohdaten (PDFs) im Workspace (`raw/`).
+- `--output-dir`: Zielverzeichnis für normalisierte JSONL-Dateien (`normalized/json/`).
+- `--max-chars`: Zielgröße eines Chunks (weiche Obergrenze).
+- `--min-chars`: minimale sinnvolle Chunk-Länge; zu kleine Rest-Chunks werden gemerged.
+- `--sentence-overlap`: Anzahl der überlappenden Sätze zwischen aufeinanderfolgenden Chunks.
+- `--verbose`: ausführlichere Logging-Ausgabe.
+
+Andere `ingest_*`-Skripte folgen demselben Grundmuster (Einlesen aus `raw/`, Normalisierung nach `normalized/json/`), verwenden aber jeweils typ-spezifische Strategien für Chunking und Struktur (Slides, Tabellen, Code-Blöcke usw.).
 
 ### 6.2 Schritt 2: Semantische Anreicherung
 
