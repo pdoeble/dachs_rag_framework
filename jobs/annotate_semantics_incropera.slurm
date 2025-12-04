@@ -16,8 +16,10 @@ module load devel/python/3.12.3-gnu-14.2 cs/ollama/0.12.2
 source "$HOME/venv/dachs_rag_312/bin/activate"
 cd "$HOME/dachs_rag_framework"
 
+mkdir -p logs
+
 # Ollama-Server direkt im Job starten
-export OLLAMA_HOST="http://localhost:11434"
+export OLLAMA_HOST="0.0.0.0:11434"
 ollama serve > /tmp/ollama_${SLURM_JOB_ID}.log 2>&1 &
 
 # kurz warten, bis der Server lauscht

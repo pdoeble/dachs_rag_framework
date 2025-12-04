@@ -650,39 +650,39 @@ def main() -> None:
 
 
 if __name__ == "__main__":#!/usr/bin/env python
-"""
-annotate_semantics.py
+    """
+    annotate_semantics.py
 
-Schritt 2 der Pipeline: normalisierte Chunks (normalized/json/*.jsonl)
-werden per LLM (Ollama) semantisch annotiert:
+    Schritt 2 der Pipeline: normalisierte Chunks (normalized/json/*.jsonl)
+    werden per LLM (Ollama) semantisch annotiert:
 
-- content_type   (Liste von IDs aus config/taxonomy/content_type.json)
-- domain         (Liste von IDs aus config/taxonomy/domain.json)
-- artifact_role  (Liste von IDs aus config/taxonomy/artifact_role.json)
-- trust_level    (eine ID aus config/taxonomy/trust_level.json)
-- chunk_role     (optionale pädagogische Rolle des Chunks: definition, example, ...)
-- language       (de/en/mixed/unknown)
+    - content_type   (Liste von IDs aus config/taxonomy/content_type.json)
+    - domain         (Liste von IDs aus config/taxonomy/domain.json)
+    - artifact_role  (Liste von IDs aus config/taxonomy/artifact_role.json)
+    - trust_level    (eine ID aus config/taxonomy/trust_level.json)
+    - chunk_role     (optionale pädagogische Rolle des Chunks: definition, example, ...)
+    - language       (de/en/mixed/unknown)
 
-Zusätzliche angereicherte Felder:
-- summary_short  (kurze, 2–3-sätzige Chunk-Zusammenfassung als String)
-- equations      (Liste von Objekten mit Informationen zu Gleichungen)
-- key_quantities (Liste von Strings mit wichtigen physikalischen Größen/Themen)
+    Zusätzliche angereicherte Felder:
+    - summary_short  (kurze, 2–3-sätzige Chunk-Zusammenfassung als String)
+    - equations      (Liste von Objekten mit Informationen zu Gleichungen)
+    - key_quantities (Liste von Strings mit wichtigen physikalischen Größen/Themen)
 
-Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben.
+    Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben.
 
-Wiederaufnahmefähig:
-- Existiert bereits eine Ausgabedatei, werden vorhandene Records pro chunk_id
-  eingelesen.
-- Bereits annotierte Chunks (semantic.trust_level vorhanden) werden übersprungen.
-- Ist die Ausgabe für eine Datei bereits vollständig annotiert, wird sie komplett
-  übersprungen.
+    Wiederaufnahmefähig:
+    - Existiert bereits eine Ausgabedatei, werden vorhandene Records pro chunk_id
+    eingelesen.
+    - Bereits annotierte Chunks (semantic.trust_level vorhanden) werden übersprungen.
+    - Ist die Ausgabe für eine Datei bereits vollständig annotiert, wird sie komplett
+    übersprungen.
 
-Erweitertes Logging:
-- Zählt die Gesamtzahl der Records.
-- Gibt Fortschritt in der Form [aktuell/gesamt] aus.
-- Schreibt Zeitstempel in den Log.
-- Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
-"""
+    Erweitertes Logging:
+    - Zählt die Gesamtzahl der Records.
+    - Gibt Fortschritt in der Form [aktuell/gesamt] aus.
+    - Schreibt Zeitstempel in den Log.
+    - Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
+    """
 
 import argparse
 import json
