@@ -12,23 +12,28 @@ werden per LLM (Ollama) semantisch annotiert:
 - chunk_role    (optionale pädagogische Rolle des Chunks: definition, example, ...)
 - language      (de/en/mixed/unknown)
 
-Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben,
-nur mit gefülltem "semantic"-Block (und ggf. language aktualisiert).
+Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben.
 
-Zusätzlich:
-- Arbeit wird pro Datei "gestückelt": Input-Dateien werden einzeln abgearbeitet.
-- Wiederaufnahmefähig:
-  - Wenn eine Output-Datei bereits existiert und genauso viele nicht-leere Zeilen
-    wie die Input-Datei hat, wird sie als "fertig" betrachtet und komplett übersprungen.
-  - Wenn das Skript mit bereits annotierten Records (mit semantic.trust_level) als
-    Input läuft, werden diese Records nicht erneut durch das LLM geschickt, sondern
-    nur durchgereicht.
+Wiederaufnahmefähig:
+- Existiert bereits eine Ausgabedatei, werden vorhandene Records pro chunk_id
+  eingelesen.
+- Bereits annotierte Chunks (semantic.trust_level vorhanden) werden übersprungen.
+- Ist die Ausgabe für eine Datei bereits vollständig annotiert, wird sie komplett
+  übersprungen.
+
+Erweitertes Logging:
+- Zählt die Gesamtzahl der Records.
+- Gibt Fortschritt in der Form [aktuell/gesamt] aus.
+- Schreibt Zeitstempel in den Log.
+- Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
 """
 
 import argparse
 import json
 import logging
 import os
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -84,18 +89,6 @@ def load_taxonomies() -> Dict[str, List[Dict[str, Any]]]:
 def extract_ids(tax_list: List[Dict[str, Any]]) -> List[str]:
     """Extrahiert alle 'id'-Felder aus einer Taxonomie-Liste."""
     return [str(entry["id"]) for entry in tax_list if "id" in entry]
-
-
-def count_nonempty_lines(path: Path) -> int:
-    """Zählt nicht-leere Zeilen in einer Datei (für Resume-Check auf Dateiebene)."""
-    if not path.is_file():
-        return 0
-    count = 0
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                count += 1
-    return count
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +393,8 @@ def normalize_semantic_result(
 
 
 # ---------------------------------------------------------------------------
-# Hauptlogik: JSONL lesen, annotieren, wieder schreiben (mit Nachbar-Kontext)
+# Hauptlogik: JSONL lesen, annotieren, wieder schreiben (mit Nachbar-Kontext,
+# und Wiederaufnahme über vorhandene Ausgabedatei / chunk_id)
 # ---------------------------------------------------------------------------
 
 def process_file(
@@ -413,17 +407,20 @@ def process_file(
     Liest eine JSONL-Datei, annotiert jeden Chunk mit LLM und schreibt
     eine neue JSONL-Datei.
 
-    - Wir laden erst alle Records in eine Liste, um prev/next-Text
-      mitgeben zu können.
-    - Wiederaufnahme auf Record-Ebene:
-      Falls ein Record bereits ein semantic-Objekt mit trust_level besitzt,
-      wird er nicht erneut durch das LLM geschickt, sondern direkt
-      in die Output-Datei geschrieben.
+    Wiederaufnahme:
+    - Falls out_path bereits existiert, werden vorhandene Records pro chunk_id
+      eingelesen.
+    - Für Chunks mit vorhandener semantic.trust_level wird kein LLM-Call mehr gemacht.
+    - Ist die bestehende Ausgabe vollständig annotiert, wird die Datei übersprungen.
+
+    Erweiterter Fortschritts-Log:
+    - Zählt total Chunks.
+    - Loggt nach jedem Chunk: [aktuell/gesamt] prozentualen Fortschritt, Elapsed, ETA.
     """
     logging.info("Verarbeite %s → %s", in_path.name, out_path.name)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1) komplette Datei einlesen
+    # 1) komplette Eingabedatei einlesen
     records: List[Dict[str, Any]] = []
     with in_path.open("r", encoding="utf-8") as fin:
         for line in fin:
@@ -440,73 +437,135 @@ def process_file(
     total = len(records)
     if total == 0:
         logging.warning("Keine gültigen Records in %s", in_path)
+        # leere Ausgabedatei erzeugen
         out_path.write_text("", encoding="utf-8")
         return
 
-    annotated = 0
+    logging.info("Chunks in Datei %s: %d", in_path.name, total)
 
-    # 2) mit Nachbar-Kontext annotieren und direkt wegschreiben
+    # 2) bestehende Ausgabedatei (falls vorhanden) einlesen
+    existing_by_chunk: Dict[str, Dict[str, Any]] = {}
+    existing_annotated = 0
+
+    if out_path.is_file():
+        logging.info("Bestehende Ausgabedatei gefunden, nutze vorhandene Annotationen: %s", out_path)
+        with out_path.open("r", encoding="utf-8") as f_old:
+            for line in f_old:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec_old = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cid = rec_old.get("chunk_id")
+                if not cid:
+                    continue
+                existing_by_chunk[cid] = rec_old
+                sem = rec_old.get("semantic") or {}
+                if isinstance(sem, dict) and sem.get("trust_level"):
+                    existing_annotated += 1
+
+        if existing_annotated == total and len(existing_by_chunk) == total:
+            logging.info(
+                "Ausgabe bereits vollständig annotiert (%d Chunks) – überspringe Datei %s.",
+                total,
+                in_path.name,
+            )
+            return
+        else:
+            logging.info(
+                "Bereits annotierte Chunks: %d/%d (%.1f%%)",
+                existing_annotated,
+                total,
+                existing_annotated * 100.0 / total,
+            )
+
+    # 3) annotieren (neue Chunks) + vorhandene übernehmen
+    annotated_new = 0
+    start_time = time.time()
+
     with out_path.open("w", encoding="utf-8") as fout:
         for idx, rec in enumerate(records):
-            # Wiederaufnahme-Check auf Record-Ebene:
-            # Wenn semantic.trust_level bereits gesetzt ist, nicht erneut LLM-Aufruf.
-            sem_existing = rec.get("semantic") or {}
-            already_annotated = isinstance(sem_existing, dict) and bool(sem_existing.get("trust_level"))
+            cid = rec.get("chunk_id")
 
-            if already_annotated:
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                continue
+            # 3a) Bereits vorhandener Record → direkt übernehmen (kein LLM)
+            if cid and cid in existing_by_chunk:
+                fout.write(json.dumps(existing_by_chunk[cid], ensure_ascii=False) + "\n")
+            else:
+                # 3b) Neuer / noch nicht annotierter Record → LLM-Klassifikation
+                content = rec.get("content", "")
+                title = rec.get("title", "") or rec.get("doc_id", "")
 
-            content = rec.get("content", "")
-            title = rec.get("title", "") or rec.get("doc_id", "")
+                prev_text = records[idx - 1]["content"] if idx > 0 else None
+                next_text = records[idx + 1]["content"] if idx + 1 < total else None
 
-            prev_text = records[idx - 1]["content"] if idx > 0 else None
-            next_text = records[idx + 1]["content"] if idx + 1 < total else None
+                llm_raw = classifier.classify_chunk(
+                    text=content,
+                    doc_title=title,
+                    taxonomies=taxonomies,
+                    prev_text=prev_text,
+                    next_text=next_text,
+                )
 
-            llm_raw = classifier.classify_chunk(
-                text=content,
-                doc_title=title,
-                taxonomies=taxonomies,
-                prev_text=prev_text,
-                next_text=next_text,
+                if llm_raw is None:
+                    # Chunk bleibt wie er ist
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                else:
+                    semantic = normalize_semantic_result(llm_raw, taxonomies)
+
+                    # language auf oberster Ebene ebenfalls setzen
+                    lang_existing = rec.get("language")
+                    if not lang_existing or lang_existing == "unknown":
+                        rec["language"] = semantic["language"]
+
+                    # semantic-Block im Record aktualisieren
+                    sem_block = rec.get("semantic") or {}
+                    sem_block.update(
+                        {
+                            "content_type": semantic["content_type"],
+                            "domain": semantic["domain"],
+                            "artifact_role": semantic["artifact_role"],
+                            "trust_level": semantic["trust_level"],
+                        }
+                    )
+                    # chunk_role nur schreiben, wenn Taxonomie existiert
+                    if taxonomies.get("chunk_role"):
+                        sem_block["chunk_role"] = semantic["chunk_role"]
+
+                    rec["semantic"] = sem_block
+
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    annotated_new += 1
+
+            # Fortschritt + ETA loggen
+            processed = idx + 1
+            elapsed = time.time() - start_time
+            frac = processed / total if total > 0 else 0.0
+
+            if frac > 0:
+                est_total = elapsed / frac
+                remaining = max(0.0, est_total - elapsed)
+                eta_dt = datetime.now() + timedelta(seconds=remaining)
+                eta_str = eta_dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                eta_str = "unknown"
+
+            logging.info(
+                "[%d/%d] (%.1f%%) elapsed %.1fs, ETA %s",
+                processed,
+                total,
+                frac * 100.0,
+                elapsed,
+                eta_str,
             )
-
-            if llm_raw is None:
-                # Nichts überschreiben, Chunk bleibt wie er ist
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                continue
-
-            semantic = normalize_semantic_result(llm_raw, taxonomies)
-
-            # language auf oberster Ebene ebenfalls setzen
-            lang_existing = rec.get("language")
-            if not lang_existing or lang_existing == "unknown":
-                rec["language"] = semantic["language"]
-
-            # semantic-Block im Record aktualisieren
-            sem_block = rec.get("semantic") or {}
-            sem_block.update(
-                {
-                    "content_type": semantic["content_type"],
-                    "domain": semantic["domain"],
-                    "artifact_role": semantic["artifact_role"],
-                    "trust_level": semantic["trust_level"],
-                }
-            )
-            # chunk_role nur schreiben, wenn Taxonomie existiert
-            if taxonomies.get("chunk_role"):
-                sem_block["chunk_role"] = semantic["chunk_role"]
-
-            rec["semantic"] = sem_block
-
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            annotated += 1
 
     logging.info(
-        "Fertig: %s (Chunks gesamt: %d, neu annotiert: %d)",
+        "Fertig: %s (Chunks gesamt: %d, vorhandene: %d, neu annotiert: %d)",
         in_path.name,
         total,
-        annotated,
+        len(existing_by_chunk),
+        annotated_new,
     )
 
 
@@ -552,7 +611,8 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="[%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     input_dir = Path(args.input_dir).expanduser().resolve()
@@ -581,32 +641,9 @@ def main() -> None:
         logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
         return
 
-    # Arbeit stückeln + Wiederaufnahme auf Dateiebene:
-    # Wenn Output-Datei existiert und die gleiche Anzahl nicht-leerer Zeilen wie
-    # die Input-Datei hat, wird diese Datei komplett übersprungen.
     for in_file in files:
         rel = in_file.name
         out_file = output_dir / rel
-
-        if out_file.exists():
-            in_lines = count_nonempty_lines(in_file)
-            out_lines = count_nonempty_lines(out_file)
-            if in_lines > 0 and in_lines == out_lines:
-                logging.info(
-                    "Überspringe %s, bereits vollständig annotiert (%d Chunks).",
-                    in_file.name,
-                    in_lines,
-                )
-                continue
-            else:
-                logging.warning(
-                    "Output-Datei %s existiert, aber Zeilenzahl passt nicht "
-                    "(input=%d, output=%d). Datei wird neu geschrieben.",
-                    out_file.name,
-                    in_lines,
-                    out_lines,
-                )
-
         process_file(in_file, out_file, classifier, taxonomies)
 
     logging.info("Semantische Anreicherung abgeschlossen.")
