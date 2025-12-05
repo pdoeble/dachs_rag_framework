@@ -1,0 +1,8 @@
+{
+  "model_name": "sentence-transformers/all-mpnet-base-v2",
+  "batch_size": 64,
+  "device": "cuda",
+  "normalize_embeddings": true,
+  "index_type": "faiss_flat",
+  "dim": 768
+}

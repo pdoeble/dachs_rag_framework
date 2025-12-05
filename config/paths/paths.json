@@ -1,0 +1,12 @@
+{
+  "workspace_root": "/beegfs/scratch/workspace/es_phdoeble-rag_pipeline",
+  "paths": {
+    "raw_pdfs": "raw",
+    "normalized_json": "normalized/json",
+    "semantic_json": "semantic/json",
+    "faiss_index": "indices/faiss/contextual.index",
+    "faiss_meta": "indices/faiss/contextual_meta.jsonl",
+    "qa_candidates": "qa_candidates/jsonl",
+    "qa_final": "qa_final/jsonl"
+  }
+}

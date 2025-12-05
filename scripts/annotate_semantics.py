@@ -36,6 +36,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from config.paths.paths_utils import get_path
 
 import requests
 
@@ -580,13 +581,13 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=str,
-        default=str(REPO_ROOT / "normalized" / "json"),
+        default=str(get_path("normalized_json")),
         help="Eingabeverzeichnis mit JSONL-Dateien (normalized/json).",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(REPO_ROOT / "semantic" / "json"),
+        default=str(get_path("semantic_json")),
         help="Ausgabeverzeichnis für angereicherte JSONL-Dateien (semantic/json).",
     )
     parser.add_argument(
@@ -1316,13 +1317,13 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=str,
-        default=str(REPO_ROOT / "normalized" / "json"),
+        default=str(get_path("normalized_json")),
         help="Eingabeverzeichnis mit JSONL-Dateien (normalized/json).",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(REPO_ROOT / "semantic" / "json"),
+        default=str(get_path("semantic_json")),
         help="Ausgabeverzeichnis für angereicherte JSONL-Dateien (semantic/json).",
     )
     parser.add_argument(

@@ -268,6 +268,53 @@ Imports von torch, transformers, faiss,
 
 einfachen FAISS-Index-Aufbau + Query.
 
+# Daten-Workspace (BeeGFS)
+/beegfs/scratch/workspace/es_phdoeble-rag_pipeline
+├─ raw/                      # Rohdaten (PDFs, Docs, etc.)
+├─ normalized/               # normalisierte Dokumente (einheitliches JSON-Schema)
+│  └─ json/
+│     └─ archive/            # ältere/archivierte Normalisierungen
+├─ semantic/                 # semantisch annotierte Daten
+│  └─ json/
+│     └─ archive/            # ältere/archivierte Annotationen
+├─ qa_candidates/            # Roh-Kandidaten für Q&A
+│  └─ jsonl/                 # eine Zeile = ein Q&A-Kandidat
+├─ qa_final/                 # finale Q&A-Datensätze
+│  └─ jsonl/                 # eine Zeile = fertiges Q&A-Sample
+├─ indices/                  # Suchindizes für RAG
+│  ├─ faiss/                 # FAISS-Vektordatenbank
+│  └─ chroma/                # Chroma-DB Index
+└─ logs/                     # Logs der Pipeline-Jobs
+
+
+
+# Home-Verzeichnis (Code, Umgebungen, Tools)
+/home/es/es_es/es_phdoeble
+├─ dachs_rag_framework/          # RAG-Framework (Git-Repo, Codebasis)
+│  ├─ config/                    # Konfigurationen
+│  │  ├─ LLM/                    # Modell-/LLM-Settings
+│  │  ├─ pipeline/               # Pipeline-Config (Stages, Pfade)
+│  │  └─ taxonomy/               # Taxonomien, Label-Schemata
+│  ├─ env/                       # Env-/Setup-Skripte
+│  ├─ jobs/                      # SLURM-Jobskripte (*.slurm)
+│  ├─ logs/                      # Framework-Logs (nicht die Daten-Logs)
+│  ├─ scripts/                   # Python-Skripte (annotate, ingest, qa, indices …)
+│  └─ wiki/                      # Doku, Workshop-Notizen, Masterplan (Markdown)
+│  ( .git/ und Unterordner → Git-Metadaten, hier weggelassen )
+│
+├─ venv/
+│  └─ dachs_rag_312/             # Virtuelle Umgebung für Projekt
+│     ├─ bin/                    # python, pip, Konsoleinträge
+│     ├─ lib/python3.12/
+│     │  └─ site-packages/       # installierte Python-Pakete
+│     └─ share/
+│
+├─ .vscode-server/               # VS Code Server (Extensions, Logs, Workspaces)
+├─ .ssh/                         # SSH-Keys und Config
+├─ .ollama/                      # Lokale Ollama-Modelldaten
+├─ .cache/                       # Pip-/Tool-Caches
+└─ .local/                       # weitere User-spezifische Tool-Daten
+
 
 ## 4.1 Normalisierte Dokumentstruktur („normalized documents“)
 
@@ -779,6 +826,7 @@ Empfehlungen:
 ---
 
 ## 6. Verarbeitungspipeline: Schritte und Skripte
+
 
 ## 6.1 Schritt 1: Ingestion & Normalisierung
 
