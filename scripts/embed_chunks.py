@@ -2,7 +2,7 @@
 """
 embed_chunks.py
 
-Erstellt Dense-Embeddings für alle normalisierten Chunks in einem Workspace
+Erstellt Dense-Embeddings für alle semantisch annotierten Chunks in einem Workspace
 und baut daraus einen FAISS-Vektorindex.
 
 Unterstützt:
@@ -11,8 +11,8 @@ Unterstützt:
 
 Workspace-Struktur:
   <workspace_root>/
-    normalized/json/     # Eingabe (Chunks)
-    indices/faiss/       # Ausgabe (Index + Metadaten)
+    semantic/json/       # Eingabe (semantisch annotierte Chunks)
+    indices/faiss/       # Ausgabe (Index + Metadaten + Config)
     logs/                # Logfiles
 
 Beispiel:
@@ -90,7 +90,7 @@ def iter_normalized_files(normalized_root: str, logger: logging.Logger) -> Gener
     außer Unterordnern namens 'archive'.
     """
     if not os.path.isdir(normalized_root):
-        logger.error("Verzeichnis für normalisierte Dateien existiert nicht: %s", normalized_root)
+        logger.error("Verzeichnis für semantische Dateien existiert nicht: %s", normalized_root)
         return
 
     for root, dirs, files in os.walk(normalized_root):
@@ -172,7 +172,7 @@ def collect_chunks(
     max_chunks: int | None = None,
 ) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
     """
-    Lädt alle Chunks aus normalized/json (inkl. .jsonl) und sammelt:
+    Lädt alle Chunks aus semantic/json (inkl. .jsonl) und sammelt:
     - Texte (für Embeddings)
     - Metadaten pro Chunk
     - Chunk-IDs
@@ -186,7 +186,9 @@ def collect_chunks(
     num_files = 0
     num_chunks = 0
 
-    for fpath in iter_normalized_files(normalized_root, logger):
+    file_paths = sorted(iter_normalized_files(normalized_root, logger))
+
+    for fpath in file_paths:
         num_files += 1
         lower = fpath.lower()
 
@@ -213,6 +215,8 @@ def collect_chunks(
                 if not text.strip():
                     continue
 
+                semantic = chunk.get("semantic", {}) or {}
+
                 meta: Dict[str, Any] = {
                     "doc_id": doc_id,
                     "chunk_id": c_id,
@@ -220,7 +224,11 @@ def collect_chunks(
                     "source_type": chunk.get("source_type"),
                     "language": chunk.get("language"),
                     "meta": chunk.get("meta", {}),
-                    "semantic": chunk.get("semantic", {}),
+                    "semantic": semantic,
+                    # flache Convenience-Felder für Filter:
+                    "trust_level": semantic.get("trust_level"),
+                    "content_type": semantic.get("content_type"),
+                    "domain": semantic.get("domain"),
                 }
 
                 texts.append(text)
@@ -274,6 +282,8 @@ def collect_chunks(
                             if not text.strip():
                                 continue
 
+                            semantic = chunk.get("semantic", {}) or {}
+
                             meta = {
                                 "doc_id": doc_id,
                                 "chunk_id": c_id,
@@ -281,7 +291,11 @@ def collect_chunks(
                                 "source_type": chunk.get("source_type"),
                                 "language": chunk.get("language"),
                                 "meta": chunk.get("meta", {}),
-                                "semantic": chunk.get("semantic", {}),
+                                "semantic": semantic,
+                                # flache Convenience-Felder für Filter:
+                                "trust_level": semantic.get("trust_level"),
+                                "content_type": semantic.get("content_type"),
+                                "domain": semantic.get("domain"),
                             }
 
                             texts.append(text)
@@ -322,7 +336,7 @@ def build_faiss_index(
     Erstellt einen FAISS-Index vom Typ IndexFlatIP oder IndexFlatL2.
     """
     if embeddings.ndim != 2:
-        raise ValueError(f"Embeddings müssen 2D sein, erhalten: {embeddings.shape}")
+        raise ValueError(f"Embeddings müssen 2D sein, erhalten: %s", embeddings.shape)
 
     num_vecs, dim = embeddings.shape
     logger.info("Erzeuge FAISS-Index mit %d Vektoren, Dimension %d", num_vecs, dim)
@@ -351,16 +365,53 @@ def save_meta_lines(meta_path: str, metas: List[Dict[str, Any]], logger: logging
     with open(meta_path, "w", encoding="utf-8") as f:
         for idx, meta in enumerate(metas):
             record = {
-                "vector_id": idx,
+                "faiss_id": idx,
                 **meta,
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     logger.info("Metadaten nach %s geschrieben (%d Zeilen).", meta_path, len(metas))
 
 
+def save_index_config(
+    config_path: str,
+    workspace_root: str,
+    index_path: str,
+    meta_path: str,
+    args: argparse.Namespace,
+    embeddings: np.ndarray,
+    use_inner_product: bool,
+    logger: logging.Logger,
+) -> None:
+    """
+    Speichert eine JSON-Konfigurationsdatei für den Index mit Modell- und Indexparametern.
+    """
+    num_vecs, dim = embeddings.shape
+
+    cfg: Dict[str, Any] = {
+        "workspace_root": workspace_root,
+        "index_path": os.path.abspath(index_path),
+        "meta_path": os.path.abspath(meta_path),
+        "model_name": args.model_name,
+        "device": args.device,
+        "embedding_dim": int(dim),
+        "num_vectors": int(num_vecs),
+        "metric": "IP" if use_inner_product else "L2",
+        "normalized": bool(args.normalize),
+        "index_type": "IndexFlatIP" if use_inner_product else "IndexFlatL2",
+        "build_timestamp": datetime.now().isoformat(timespec="seconds"),
+        "script": "embed_chunks.py",
+    }
+
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    logger.info("Index-Konfiguration nach %s geschrieben.", config_path)
+
+
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Erzeuge FAISS-Index aus normalisierten Chunks (Embeddings)."
+        description="Erzeuge FAISS-Index aus semantisch annotierten Chunks (Embeddings)."
     )
     parser.add_argument(
         "--workspace-root",
@@ -404,6 +455,11 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default="contextual_meta.jsonl",
         help="Dateiname für die Metadaten-JSONL unter indices/faiss/.",
     )
+    parser.add_argument(
+        "--config-name",
+        default="contextual_config.json",
+        help="Dateiname für die Index-Konfiguration unter indices/faiss/.",
+    )
     return parser.parse_args(argv)
 
 
@@ -411,16 +467,18 @@ def main(argv: List[str] | None = None) -> int:
     args = parse_args(argv)
 
     workspace_root = os.path.abspath(args.workspace_root)
-    normalized_root = os.path.join(workspace_root, "normalized", "json")
+    normalized_root = os.path.join(workspace_root, "semantic", "json")
     indices_root = os.path.join(workspace_root, "indices", "faiss")
     index_path = os.path.join(indices_root, args.index_name)
     meta_path = os.path.join(indices_root, args.meta_name)
+    config_path = os.path.join(indices_root, args.config_name)
 
     logger = setup_logging(workspace_root)
     logger.info("Workspace-Root: %s", workspace_root)
-    logger.info("Normalized Root: %s", normalized_root)
+    logger.info("Semantic Root: %s", normalized_root)
     logger.info("Index wird geschrieben nach: %s", index_path)
     logger.info("Metadaten werden geschrieben nach: %s", meta_path)
+    logger.info("Config wird geschrieben nach: %s", config_path)
 
     texts, metas, chunk_ids = collect_chunks(
         normalized_root=normalized_root,
@@ -431,6 +489,15 @@ def main(argv: List[str] | None = None) -> int:
     if not texts:
         logger.error("Keine Chunks gefunden – Abbruch.")
         return 1
+
+    # Check auf doppelte chunk_id
+    unique_chunk_ids = len(set(chunk_ids))
+    if unique_chunk_ids != len(chunk_ids):
+        logger.warning(
+            "Es gibt doppelte chunk_id-Werte: %d unique von %d Gesamt.",
+            unique_chunk_ids,
+            len(chunk_ids),
+        )
 
     logger.info(
         "Starte Embedding-Berechnung mit Modell '%s' auf Gerät '%s'.",
@@ -471,17 +538,36 @@ def main(argv: List[str] | None = None) -> int:
     use_ip = bool(args.normalize)
     index = build_faiss_index(embeddings, use_inner_product=use_ip, logger=logger)
 
+    if index.ntotal != len(metas):
+        logger.error(
+            "Inkonsistenz: Index-Vektoren (%d) != Anzahl Metadatensätze (%d).",
+            index.ntotal,
+            len(metas),
+        )
+        return 1
+
     os.makedirs(indices_root, exist_ok=True)
     faiss.write_index(index, index_path)
     logger.info("FAISS-Index in %s gespeichert.", index_path)
 
     save_meta_lines(meta_path, metas, logger)
+    save_index_config(
+        config_path=config_path,
+        workspace_root=workspace_root,
+        index_path=index_path,
+        meta_path=meta_path,
+        args=args,
+        embeddings=embeddings,
+        use_inner_product=use_ip,
+        logger=logger,
+    )
 
     logger.info(
-        "Fertig. Vektoren: %d, Index: %s, Meta: %s",
+        "Fertig. Vektoren: %d, Index: %s, Meta: %s, Config: %s",
         len(metas),
         index_path,
         meta_path,
+        config_path,
     )
     return 0
 

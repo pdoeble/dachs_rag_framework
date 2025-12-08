@@ -177,35 +177,38 @@ Die Verarbeitungspipeline für einen Workspace (z. B. `es_phdoeble-rag_pipeline`
 3. **Semantische Anreicherung (`normalized/json/ → semantic/json/`)**  
    - LLM-basierte Anreicherung der Chunks, z. B.:
      - `chunk_role` (exercise, explanation, derivation, table, figure, …),  
-     - domänenspezifische Labels / Taxonomie,  
+     - domänenspezifische Labels / Taxonomie (`content_type`, `domain`, `artifact_role`, `trust_level`),  
      - kurze Zusammenfassungen, Key-Quantities, Formeln.  
-   - Dieser Schritt kann bereits **Retrieval-Kontext** aus dem FAISS-Index nutzen (siehe unten), falls vorhanden.
+   - Ergebnis: angereicherte Chunks in `semantic/json/` mit gefülltem `semantic`-Block.  
+   - Optional kann dieser Schritt bereits **Retrieval-Kontext** aus einem vorhandenen FAISS-Kontextindex nutzen (zweiter Durchlauf, siehe unten).
 
-4. **Kontext- und RAG-Indizes (`normalized/json/ → indices/faiss/`, optional `indices/chroma/`)**  
-   - Aufbau eines **globale(n) Chunk-Index** über alle normalisierten Chunks des Workspaces:  
+4. **Kontext- und RAG-Indizes (`semantic/json/ → indices/faiss/`, optional `indices/chroma/`)**  
+   - Aufbau eines **globalen Chunk-Kontextindex** über alle semantisch angereicherten Chunks des Workspaces:  
      - Skript: `scripts/embed_chunks.py`  
-     - Input: `normalized/json/`  
-     - Output:  
-       - `indices/faiss/contextual.index` (FAISS-Vektorindex),  
-       - `indices/faiss/contextual_meta.jsonl` (Metadaten je Vektor, inkl. `chunk_id`, `doc_id`, `source_path`, …).  
-   - Dieser Kontextindex wird von mehreren Schritten genutzt:
-     - Retrieval-unterstützte semantische Anreicherung (LLM bekommt Nachbar-Chunks als Zusatzkontext),  
-     - Q/A-Kandidaten-Generierung (Gruppenbildung mehrerer thematisch naher Chunks),  
-     - spätere RAG-Nutzung (z. B. KNIME, interaktive Assistenten).  
-   - Optional: weitere spezialisierte Indizes (z. B. nur über high-trust-Quellen) können darauf aufbauen.
+     - Input: `semantic/json/`  
+     - Output unter `indices/faiss/`:  
+       - `contextual.index` – FAISS-Vektorindex (z. B. `IndexFlatIP` oder `IndexFlatL2`),  
+       - `contextual_meta.jsonl` – Metadaten je Vektor/Chunk,  
+       - `contextual_config.json` – kleine JSON-Konfiguration zum Index (Modell, Dimension, Pfade, Erstellungszeitpunkt usw.).  
+   - Jede Zeile in `contextual_meta.jsonl` enthält u. a.:  
+     - `faiss_id` (0-basierte Position des Vektors im FAISS-Index),  
+     - `doc_id`, `chunk_id`, `source_path`, `source_type`, `language`,  
+     - `meta` (zusätzliche technische Informationen),  
+     - `semantic` (kompletter Semantik-Block),  
+     - flache Convenience-Felder wie `trust_level`, `content_type`, `domain` (redundant zu `semantic`, aber einfacher für Filter).  
+   - `embed_chunks.py` führt vor dem Index-Bau einfache Konsistenz-Checks durch (z. B. doppelte `chunk_id`s, Längen-Mismatch zwischen Embeddings und Metadaten) und loggt diese in `logs/indices/`.
 
 5. **Q/A-Kandidaten-Generierung (`semantic/json/ → qa_candidates/jsonl/`)**  
    - LLM erzeugt Frage–Antwort-Paare auf Basis von semantisch angereicherten Chunks und deren Nachbarschaft im Kontextindex.  
-   - Nutzung des FAISS-Index für Multi-Chunk-Kontext (z. B. Aufgabe + Erklärung + zentrale Formel).
+   - Nutzung des FAISS-Kontextindex für Multi-Chunk-Kontext (z. B. Aufgabe + Erklärung + zentrale Formel).
 
 6. **Filterung & Qualitätssicherung (`qa_candidates/jsonl/ → qa_final/jsonl/`)**  
    - Heuristische und LLM-basierte Filter (z. B. Konsistenzchecks, Dubletten, Verständlichkeit, Groundedness).  
    - Optional: Verwendung des Kontextindex, um zu prüfen, ob Antworten wirklich im lokalen Kontext (Chunk + Nachbarn) verankert sind.
 
 7. **Training / Fine-Tuning & Serving**  
-   - Verwendung von `qa_final/jsonl/` für Instruction-Tuning bzw. Fine-Tuning domänenspezifischer Modelle (HuggingFace Transformers + PEFT/LoRA, o. Ä.).  
+   - Verwendung von `qa_final/jsonl/` für Instruction-Tuning bzw. Fine-Tuning domänenspezifischer Modelle (HuggingFace Transformers + PEFT/LoRA o. Ä.).  
    - Deployment/Serving auf DACHS bzw. lokal (z. B. über vLLM, Ollama, KNIME-Pipelines).
-
 
 ### 3.3 Bilingualität und Sprachmix
 
@@ -284,6 +287,7 @@ Imports von torch, transformers, faiss,
 einfachen FAISS-Index-Aufbau + Query.
 
 # Daten-Workspace (BeeGFS)
+```bash
 /beegfs/scratch/workspace/es_phdoeble-rag_pipeline
 ├─ raw/                      # Rohdaten (PDFs, Docs, etc.)
 ├─ normalized/               # normalisierte Dokumente (einheitliches JSON-Schema)
@@ -300,10 +304,11 @@ einfachen FAISS-Index-Aufbau + Query.
 │  ├─ faiss/                 # FAISS-Vektordatenbank
 │  └─ chroma/                # Chroma-DB Index
 └─ logs/                     # Logs der Pipeline-Jobs
-
+```
 
 
 # Home-Verzeichnis (Code, Umgebungen, Tools)
+```bash
 /home/es/es_es/es_phdoeble
 ├─ dachs_rag_framework/          # RAG-Framework (Git-Repo, Codebasis)
 │  ├─ config/                    # Konfigurationen
@@ -329,7 +334,7 @@ einfachen FAISS-Index-Aufbau + Query.
 ├─ .ollama/                      # Lokale Ollama-Modelldaten
 ├─ .cache/                       # Pip-/Tool-Caches
 └─ .local/                       # weitere User-spezifische Tool-Daten
-
+```
 
 ## 4.1 Normalisierte Dokumentstruktur („normalized documents“)
 
@@ -474,6 +479,19 @@ Zusätzlich zur Normalform werden semantische Metadaten gepflegt. Diese werden i
   }
 }
 ```
+
+**Kontext- und RAG-Indizes (`semantic/json/ → indices/faiss/`, optional `indices/chroma/`)**  
+- Aufbau eines **globalen Chunk-Kontextindex** über alle Chunks des Workspaces:  
+  - Skript: `scripts/embed_chunks.py`  
+  - Input: `semantic/json/`  
+  - Output:  
+    - `indices/faiss/contextual.index` (FAISS-Vektorindex),  
+    - `indices/faiss/contextual_meta.jsonl` (Metadaten je Vektor, inkl. `faiss_id`, `chunk_id`, `doc_id`, `source_path`, `language`, `meta`, `semantic`, …),  
+    - `indices/faiss/contextual_config.json` (Konfiguration: Embedding-Modell, Dimension, Index-Typ, Pfade, Erstellungszeitpunkt, Normalisierungsmodus).  
+
+- **`faiss_id`** entspricht der Position des Vektors im FAISS-Index (`IndexFlat*`) und dient als Schlüssel, um Suchergebnisse (`faiss_id`) wieder auf `chunk_id`/`doc_id` zu mappen.  
+- Die Config-Datei wird von `embed_chunks.py` automatisch erzeugt und kann von anderen Komponenten (z. B. KNIME, QA-Generator, Analyse-Skripte) genutzt werden, um Modell/Index-Parameter ohne harten Code zu lesen.
+
 ### 4.2.0 Taxonomie-Konfiguration (config/taxonomy)
 
 Die zulässigen Werte der semantischen Felder
@@ -993,14 +1011,24 @@ Konfigurierbare Parameter (z. B. in `config/pipeline/semantic_config.json`):
 - `similarity_threshold: float` (optional, um sehr schwache Nachbarn zu verwerfen)  
 - `max_context_chars_per_neighbor` (z. B. 500 Zeichen pro Nachbar).
 
-### 6.2.3 Ein- und Ausgabeformate
+## 6.2.3 Ein- und Ausgabeformate
 
 - **Input:** Chunks aus `normalized/json/` (JSON/JSONL, Schema siehe 4.1).  
 - **Output:** Angereicherte Chunks mit gefülltem `semantic`-Block unter `semantic/json/`, gleiche `doc_id`/`chunk_id`.
 
-Der FAISS-Kontextindex selbst wird aus den normalisierten Chunks aufgebaut (`scripts/embed_chunks.py`, siehe Abschnitt 6.5.1) und steht dann für alle Anreicherungsschritte zur Verfügung.
+Standardmäßig läuft die semantische Anreicherung ohne Retrieval, d. h. das LLM sieht nur den Ziel-Chunk und ggf. lokale Nachbarn im Dokument.  
 
----
+Wenn bereits ein FAISS-Kontextindex für den Workspace existiert (siehe 6.5.1), kann die Anreicherung in einem zweiten Lauf mit `use_retrieval_for_semantics = true` betrieben werden. In diesem Fall werden für jeden Chunk Top-k-Nachbarn aus dem Kontextindex geholt und als zusätzlicher Kontext in den Prompt gegeben (siehe 6.2.2).
+
+Der FAISS-Kontextindex selbst wird in der Regel aus den semantisch angereicherten Chunks in `semantic/json/` aufgebaut (siehe 6.5.1). Er steht dann insbesondere für:
+
+- Retrieval-unterstützte semantische Anreicherung in einem zweiten Lauf,  
+- Q/A-Kandidaten-Generierung und deren Qualitätssicherung,  
+- nachgelagerte RAG-Workflows (z. B. KNIME, interaktive Assistenten)
+
+zur Verfügung.
+
+
 
 ## 6.3 Generierung von Q/A-Kandidaten (aktualisiert, FAISS-basiert)
 
@@ -1093,31 +1121,61 @@ Ergebnis:
 
 ## 6.5 Aufbau von Vektorindizes (aufgeteilt in Kontext- und RAG-Indizes)
 
-### 6.5.1 Kontextindex auf Chunk-Ebene (`embed_chunks.py`)
+## 6.5.1 Skript `embed_chunks.py` (Kontextindex)
 
-Der **Kontextindex** ist der zentrale Vektorindex, der über *alle Chunks* eines Workspaces gelegt wird:
+Dieses Skript baut den FAISS-Kontextindex auf und speichert Metadaten und Index-Konfiguration.
 
-- Skript: `scripts/embed_chunks.py`  
-- Input: `normalized/json/` (inkl. `.jsonl`)  
-- Output:
-  - `indices/faiss/contextual.index` – FAISS-Index über alle Embeddings,  
-  - `indices/faiss/contextual_meta.jsonl` – Metadaten je Vektor.
+**Input / Output**
 
-Vorgehen (high level):
+- **Input:**  
+  - Semantisch angereicherte Chunks aus `semantic/json/` (JSON/JSONL, Schema siehe 4.1/4.2).  
+- **Output (`indices/faiss/`):**  
+  - `contextual.index` – FAISS-Index (`IndexFlatIP` bei normalisierten Embeddings, sonst `IndexFlatL2`).  
+  - `contextual_meta.jsonl` – pro Zeile die Metadaten zu einem Vektor mit:
+    - `faiss_id` (0-basierte Position im Index),  
+    - `doc_id`, `chunk_id`, `source_path`, `source_type`, `language`,  
+    - `meta`, `semantic`, ggf. flache Convenience-Felder (`trust_level`, `content_type`, `domain`).  
+  - `contextual_config.json` – Konfigurationsdatei mit:
+    - `build_timestamp`,  
+    - `workspace_root`, `index_path`, `meta_path`,  
+    - `index_type` (z. B. `IndexFlatIP` oder `IndexFlatL2`),  
+    - `model_name`, `embedding_dim`,  
+    - `num_vectors`,  
+    - `normalized` (bool),  
+    - `device` (z. B. `cuda` oder `cpu`).
 
-1. Alle Dateien unter `normalized/json/` durchlaufen (`.json` und `.jsonl`, `archive/` ignorieren).  
-2. Pro Chunk einen Textstring bilden (z. B. `title + "
+**Wichtige CLI-Argumente**
 
-" + content`).  
-3. Embeddings mit einem Sentence-Transformer-Modell erzeugen (z. B. `all-mpnet-base-v2`).  
-4. Embeddings (optional L2-normalisiert) in einen FAISS-Index schreiben (z. B. `IndexFlatIP` für Cosine-Ähnlichkeit).  
-5. Metadaten (u. a. `doc_id`, `chunk_id`, `source_path`, `language`, `semantic`) parallel in einer JSONL-Datei speichern, in der Reihenfolge der Vektoren.
+- `--workspace-root` – Wurzel des Workspaces (z. B. `/beegfs/scratch/workspace/es_phdoeble-rag_pipeline`).  
+- `--model-name` – Name des Sentence-Transformer-Modells.  
+- `--device` – Zielgerät (`cuda`/cpu).  
+- `--batch-size` – Batchgröße für die Embedding-Berechnung.  
+- `--normalize` – aktiviert L2-Normalisierung der Embeddings und `IndexFlatIP` (Cosine-ähnliche Suche).  
+- `--max-chunks` – optionales Limit für die Anzahl der Chunks (Testläufe).  
+- `--index-name` – Dateiname des FAISS-Index (Standard: `contextual.index`).  
+- `--meta-name` – Dateiname der Meta-JSONL (Standard: `contextual_meta.jsonl`).  
+- `--config-name` – Dateiname der Konfig-JSON (Standard: `contextual_config.json`).
 
-Dieser Kontextindex ist:
+**Robustheits-Checks und Logging**
 
-- **Lesend** zugänglich für andere Skripte (z. B. `faiss_retriever.py`),  
-- Grundlage für Retrieval-augmented Semantik- und Q/A-Schritte,  
-- Basis für KNIME-/RAG-Workflows.
+- Das Skript loggt nach `logs/indices/embed_chunks_*.log` und auf STDOUT.  
+- Vor dem Index-Bau prüft es u. a.:
+
+  - **Konsistenz Längen:**  
+    - Anzahl `texts` == Anzahl `metas` == Anzahl `chunk_ids`.  
+    - Anzahl Embeddings (`embeddings.shape[0]`) == Anzahl Metadaten.  
+    - Bei Abweichungen: `ERROR`-Log und Abbruch (`return 1`).
+
+  - **doppelte `chunk_id`s:**  
+    - Zählt Vorkommen von `chunk_id`.  
+    - Bei Duplikaten: `WARNING` mit Anzahl und Beispiel-IDs.  
+
+  - **Embedding-Shape:**  
+    - Embeddings müssen 2D sein (N × D); bei Abweichung wird ein `ValueError` geworfen.  
+    - Dimension `D` wird im Log und in `contextual_config.json` abgelegt.
+
+- Zusätzlich wird der verwendete Index-Typ (IP vs. L2), die Gesamtzahl der Vektoren und die Pfade der erzeugten Dateien geloggt.
+
 
 ### 6.5.2 Zusätzliche RAG-Indizes (optional)
 
@@ -1127,7 +1185,7 @@ Neben dem globalen Kontextindex können weitere spezialisierte Indizes aufgebaut
 - Index nur über „vertrauenswürdige“ Chunks (z. B. Normen, Lehrbücher).  
 - Index auf Dokumentebene (Aggregat-Embeddings pro Dokument oder Kapitel).
 
-Ein generisches Skript (Platzhalter: `build_indices.py`) kann auf Basis von:
+Ein generisches Skript (Platzhalter: `embed_chunks.py`) kann auf Basis von:
 
 - `semantic/json/`  
 - oder bereits produzierten `qa_final/jsonl/`
