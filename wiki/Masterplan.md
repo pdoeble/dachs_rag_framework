@@ -312,10 +312,10 @@ einfachen FAISS-Index-Aufbau + Query.
 /home/es/es_es/es_phdoeble
 ├─ dachs_rag_framework/          # RAG-Framework (Git-Repo, Codebasis)
 │  ├─ config/                    # Konfigurationen
-│  │  ├─ taxonomy/               # Taxonomien, Label-Schemata
 │  │  ├─ LLM/                    # Modell-/LLM-Settings
 │  │  ├─ pipeline/               # Pipeline-Config (Stages, Pfade)
-│  │  └─ qa/                     # Q & A Settings
+│  │  ├─ qa/                     # Q/A-Generierung (generate_qa_candidates; Filter, Nachbarschaft, LLM-Config)
+│  │  └─ taxonomy/               # Taxonomien, Label-Schemata
 │  ├─ env/                       # Env-/Setup-Skripte
 │  ├─ jobs/                      # SLURM-Jobskripte (*.slurm)
 │  ├─ logs/                      # Framework-Logs (nicht die Daten-Logs)
@@ -1056,22 +1056,33 @@ Der FAISS-Kontextindex selbst wird in der Regel aus den semantisch angereicherte
 zur Verfügung.
 
 
-
 ## 6.3 Generierung von Q/A-Kandidaten (aktualisiert, FAISS-basiert)
 
-Die Q/A-Kandidaten-Generierung (`generate_qa_candidates.py`) nutzt semantisch annotierte Chunks aus
+Die Q/A-Kandidaten-Generierung (`scripts/generate_qa_candidates.py`) nutzt semantisch annotierte Chunks aus
 
 ```text
 semantic/json/
 ```
 
-und erzeugt erste Frage–Antwort-Paare, die nachgelagert gefiltert werden.
+und erzeugt daraus erste Frage–Antwort-Paare, die anschließend von einem separaten Schritt gefiltert und zu einem finalen Trainingsdatensatz zusammengeführt werden.
+
+Der Schritt arbeitet strikt **workspace-lokal**:
+
+- Input: `semantic/json/*.jsonl` (oder `.json`)
+- Output: `qa_candidates/jsonl/*.jsonl`
+- Kontext: globaler Chunk-Kontextindex unter `indices/faiss/` (geladen über `FaissRetriever`)
 
 ### 6.3.1 Grundidee
 
-- Ein einzelner Chunk eignet sich oft nur für **einfache** Fragen.  
-- Viele interessante Fragen beziehen sich auf **mehrere** zusammenhängende Passagen (z. B. Theorie + Beispiel + Randbedingung).  
+- Ein einzelner Chunk reicht meist nur für **triviale** Fragen.
+- Interessante Fragen beziehen sich typischerweise auf **mehrere** zusammenhängende Passagen (z. B. Theorie + Beispiel + Randbedingung, Text + Formel, Problemstellung + Lösung).
 - Deshalb werden **Gruppen von Chunks** gebildet, aus denen das LLM jeweils mehrere Q/A-Paare ableiten kann.
+
+Ziel ist ein robuster Satz von Q/A-Kandidaten, die:
+
+- klar auf konkrete Chunks verweisen,
+- in der Fachsprache der Domäne bleiben,
+- später gezielt gefiltert, angereichert und für Instruction-Tuning verwendet werden können.
 
 ### 6.3.2 Gruppenbildung mit Semantik + FAISS-Nachbarschaft
 
@@ -1079,69 +1090,221 @@ Für jeden ausgewählten Kandidaten-Chunk wird eine **Kontextgruppe** aus mehrer
 
 Diese Gruppenbildung nutzt:
 
-- die semantischen Labels in `semantic/*` (z. B. `chunk_role`, `domain`, `content_type`, `trust_level`),
-- den globalen Kontextindex (`contextual.index`),
-- den Helfer `FaissRetriever` für FAISS-Abfragen.
+- die semantischen Labels in `semantic/json/` (z. B. `chunk_role`, `domain`, `content_type`, `trust_level`),
+- den globalen Kontextindex (`indices/faiss/contextual.index`),
+- das Helfermodul `FaissRetriever` für FAISS-Abfragen.
 
-Ablauf (Beispielschema):
+Ablauf (Vereinfachung):
 
 1. **Kandidatenchunk `C` wählen**  
-   - z. B. Chunks mit bestimmten `semantic.chunk_role`-Werten (`exercise`, `example`, `key_result`, …),
-   - Mindest-`trust_level` (z. B. nicht `low`).
+   Auswahl über Filter, z. B.:
+
+   - Sprache (`language` in erlaubten Werten, z. B. `"de"` oder `"en"`),
+   - `semantic.trust_level` ∈ {`high`, `medium`},
+   - `semantic.chunk_role` ∈ {`definition`, `explanation`, `example`, `key_result`, `exercise`},
+   - `semantic.content_type` in einer Whitelist (z. B. `textbook`, `handbook`, `simulation_report`, `api_doc`),
+   - nicht-leerer Text (`content`).
 
 2. **Semantische Nachbarn über FAISS holen**  
-   - Über `FaissRetriever.get_neighbors_for_chunk(chunk_id=C.chunk_id, top_k=K)` werden die `K` ähnlichsten Chunks bestimmt.
-   - `FaissRetriever` liefert für jeden Treffer Metadaten plus `score`, `faiss_id`, `chunk_id`, `doc_id`.
+
+   Über
+
+   ```python
+   neighbors = retriever.get_neighbors_for_chunk(
+       chunk_id=C["chunk_id"],
+       top_k=TOP_K,
+   )
+   ```
+
+   werden die ähnlichsten Chunks zu `C` bestimmt. Jeder Nachbar enthält u. a.:
+
+   - `chunk_id`, `doc_id`, `source_path`, `language`,
+   - kompletten `semantic`-Block,
+   - Convenience-Felder (`trust_level`, `content_type`, `domain`),
+   - einen Score (`score`) mit Ähnlichkeit/Distanz.
 
 3. **Nachbarn filtern**  
-   - Es werden nur Nachbarn behalten, die z. B. folgende Kriterien erfüllen:
-     - gleiche oder verwandte `semantic.domain` (fachliche Nähe),
-     - bevorzugt gleiche `doc_id` (lokaler Zusammenhang),
-     - passende `content_type` (z. B. `textbook`, nicht `catalog`),
-     - ggf. ausreichender `trust_level`.
-   - Optional: harte Grenze auf `score` (`similarity_threshold`).
+
+   Es werden nur Nachbarn behalten, die z. B.:
+
+   - eine erlaubte Sprache haben,
+   - einen zulässigen `trust_level` besitzen,
+   - in eine erlaubte `content_type`-Klasse fallen,
+   - im Domain-Schnitt mit `C` liegen (`domain`-Overlap),
+   - einen Score oberhalb eines Schwellwerts (`similarity_threshold`) haben.
+
+   Zusätzlich wird die Anzahl der Nachbarn auf einen Maximalwert begrenzt (z. B. 8).
 
 4. **Lokale Nachbarn ergänzen**  
-   - Zusätzlich zu FAISS-Nachbarn werden 1–3 lokale Nachbarn im gleichen Dokument berücksichtigt:
-     - vorherige / folgende Chunks,
-     - Chunks mit gleicher Section-ID oder `page_range`.
+
+   Zusätzlich zu den FAISS-Nachbarn werden einige **lokale Nachbarn** im gleichen Dokument ergänzt:
+
+   - vorangehende Chunks (`chunk_id`/Index −1, −2, …),
+   - nachfolgende Chunks (`chunk_id`/Index +1, +2, …).
+
+   Die Anzahl dieser lokalen Nachbarn ist über die QA-Config steuerbar (z. B. `max_local_neighbors_before = 1`, `max_local_neighbors_after = 1`).
 
 5. **Kontextgruppe bauen**  
-   - Aus `C` + gefilterten FAISS-Nachbarn + lokalen Nachbarn entsteht eine Gruppe von z. B. 3–8 Chunks.
-   - Diese Gruppe wird als strukturierter Input für den Q/A-LLM-Prompt aufbereitet:
-     - Liste von Chunks mit `chunk_id`, `doc_id`, kurzer Textzusammenfassung oder Ausschnitt,
-     - klare Instruktion an das LLM, welche Arten von Fragen/Antworten erzeugt werden sollen (z. B. konzeptionelle vs. Rechenfragen).
 
-Die eigentliche Q/A-Generierung (`generate_qa_candidates.py`) arbeitet dann gruppenweise und schreibt die erzeugten Frage–Antwort-Paare nach `qa_candidates/jsonl/`, inklusive Referenzen auf alle beteiligten `chunk_id`s und deren `doc_id`s.
+   Aus
 
----
+   - Ankerchunk `C`,
+   - gefilterten FAISS-Nachbarn und
+   - lokalen Nachbarn
 
-### 6.3.3 LLM-Prompt für Q/A-Generierung
+   entsteht eine Gruppe von typischerweise 3–6 Chunks. Doppelte `chunk_id`s werden entfernt; Gruppe und Gruppengröße sind in der QA-Config begrenzt:
 
-Der Prompt erhält:
+   - `min_group_size` (z. B. 2),
+   - `max_group_size` (z. B. 6).
 
-- Liste der Kontextchunks (mit `chunk_id`, `doc_id`, kurzem Label und Text).  
-- Eindeutige Anweisungen, z. B.:
-  - „Erzeuge 1–3 präzise Fragen, die *nur* mit den gegebenen Texten beantwortbar sind.“  
-  - „Gib zu jeder Frage eine prägnante, textnahe Antwort an.“  
-  - „Nutze Fachbegriffe und Symbolik exakt so, wie sie in den Texten vorkommen.“
+   Diese Gruppe wird als strukturierter Input für den LLM-Prompt verwendet: Liste von Chunks mit `chunk_id`, `doc_id`, optional `summary_short` und gekürztem `content`.
 
-Die Ausgabe wird als JSONL nach
+### 6.3.3 LLM-Prompt und Ausgabeformat
 
-```text
-qa_candidates/jsonl/
+Der LLM-Prompt besteht aus:
+
+- einem **System-Prompt** (z. B. „Du bist ein Experten-Assistent für Thermodynamik und Engineering“),
+- einem **User-Prompt**, der:
+  - die Kontextchunks (mit Labels und Text) einbettet,
+  - klare Anweisungen zur Anzahl und Art der Fragen enthält.
+
+Die Prompts werden bevorzugt aus Dateien geladen:
+
+- `config/prompts/qa_generation_system.txt`
+- `config/prompts/qa_generation_user.txt`
+
+Falls diese Dateien fehlen, nutzt das Skript interne Defaults.
+
+Der User-Prompt enthält Platzhalter wie:
+
+- `{CONTEXT}` – wird durch die formatierte Kontextgruppe ersetzt,
+- `{MAX_QA_PER_GROUP}` – maximale Anzahl an Q/A-Paaren, die das LLM erzeugen soll.
+
+Die LLM-Antwort wird als JSON-Array erwartet:
+
+```json
+[
+  {
+    "question": "…",
+    "answer": "…",
+    "difficulty": "basic | intermediate | advanced"
+  },
+  …
+]
 ```
 
-geschrieben, eine Zeile pro Q/A-Kandidat mit u. a.:
+`generate_qa_candidates.py` extrahiert dieses Array (auch wenn das LLM zusätzlichen Text generiert), prüft die Einträge grob und wandelt jedes Element in einen Q/A-Kandidaten-Datensatz um.
 
-- `question`, `answer`,  
-- Referenzen auf verwendete `chunk_id`s (`source_chunks: [ ... ]`),  
-- Metadaten (z. B. `doc_id`, `domain`, `difficulty` falls anwendbar).
+**Zentrales Ausgabeformat (pro Zeile in `qa_candidates/jsonl/`):**
 
----
+```json
+{
+  "id": "pdf_Incropera_2006_3fe640ba_c0260_qa42",
+  "anchor_chunk_id": "pdf_Incropera_2006_3fe640ba_c0260",
+  "anchor_doc_id": "pdf_Incropera_2006_3fe640ba",
+  "source_chunks": [
+    "pdf_Incropera_2006_3fe640ba_c0260",
+    "pdf_Incropera_2006_3fe640ba_c0261",
+    "pdf_Incropera_2006_3fe640ba_c0262"
+  ],
+  "doc_ids": [
+    "pdf_Incropera_2006_3fe640ba"
+  ],
+  "question": "…",
+  "answer": "…",
+  "difficulty": "intermediate",
+  "language": "de",
+  "content_type": ["textbook"],
+  "domain": ["thermodynamics"],
+  "trust_level": "high",
+  "workspace_file": "Incropera_semantic.jsonl"
+}
+```
 
+Dieser Schritt erzeugt bewusst **Roh-Kandidaten**. Die eigentliche Bereinigung, Konsolidierung und Konvertierung in ein finales Instruction-Format (`qa_final/jsonl/`) erfolgt in einem nachgelagerten Schritt (z. B. `qa_filter_and_merge.py`).
 
-### 6.4 Schritt 4: Qualitätssicherung der Q/A-Sätze
+### 6.3.4 Konfiguration und CLI von `generate_qa_candidates.py`
+
+Die Q/A-Generierung wird über eine eigene JSON-Konfigurationsdatei gesteuert:
+
+```text
+config/qa/qa_generation.default.json
+```
+
+Struktur (vereinfachter Überblick):
+
+- `paths`:
+  - `workspace_root` – Default-Workspace-Root (z. B. `/beegfs/scratch/workspace/es_phdoeble-rag_pipeline`),
+  - `semantic_dir` – Pfad relativ zum Workspace (Standard: `semantic/json`),
+  - `qa_candidates_dir` – Pfad für Q/A-Kandidaten (Standard: `qa_candidates/jsonl`),
+  - `faiss_index_dir` – Pfad zu `indices/faiss`,
+  - Dateinamen für Index, Meta-JSONL, Index-Config,
+  - Pfade zu Prompt-Dateien (`prompt_system_file`, `prompt_user_template_file`).
+
+- `filters`:
+  - erlaubte Sprachen (`languages_allowed`),
+  - erlaubte `trust_level`s,
+  - Whitelists für `chunk_role` und `content_type`.
+
+- `neighbors`:
+  - `top_k_faiss` – Anzahl abgefragter FAISS-Nachbarn,
+  - `similarity_threshold` – Mindestscore,
+  - `max_neighbors` – maximale Anzahl verwendeter FAISS-Nachbarn,
+  - `max_local_neighbors_before` / `max_local_neighbors_after` – lokale Nachbarn im Dokument.
+
+- `grouping`:
+  - `min_group_size`, `max_group_size`,
+  - optional `max_tokens_context` (für zukünftige Token-basierte Begrenzung).
+
+- `sampling`:
+  - `max_qa_per_group` – wie viele Q/A pro Kontextgruppe generiert werden,
+  - `max_groups_per_chunk` – Gruppenbegrenzung pro Ankerchunk (derzeit typischerweise 1),
+  - `max_qa_per_document` – Limit pro Eingabedatei,
+  - `global_qa_limit` – hartes Global-Limit für große Läufe.
+
+- `llm`:
+  - `backend` (z. B. `"ollama"`),
+  - `model` (z. B. `"llama3.1:8b-instruct"`),
+  - Sampling-Parameter (`temperature`, `top_p`),
+  - `max_tokens`, `request_timeout_s`, `max_retries`.
+
+- `runtime`:
+  - `num_workers` (Reserve für zukünftige Parallelisierung),
+  - `shuffle_files` (Dateireihenfolge zufällig oder sequenziell),
+  - `resume_mode` (`append` = an bestehende Dateien anhängen, `overwrite` = neu schreiben),
+  - `dry_run` (ohne LLM-Aufruf, nur Logging),
+  - `log_level`, `log_every_n_examples`.
+
+- `output`:
+  - `qa_schema_version`,
+  - `include_source_text` (Reserveflag),
+  - `include_semantic_tags`,
+  - `output_file_pattern` (z. B. `{input_basename}.qa_candidates.jsonl`).
+
+- `debug`:
+  - `limit_num_files`, `limit_num_chunks` – harte Limits für Tests,
+  - `dump_example_prompts`, `example_prompts_dir` – optionales Prompt-Dumping.
+
+**Aufruf über CLI (Beispiele):**
+
+Standardlauf (Workspace aus Config, alle Dateien):
+
+```bash
+cd ~/dachs_rag_framework
+python scripts/generate_qa_candidates.py
+```
+
+Spezieller Workspace + reduzierte Anzahl Dateien, explizite Config:
+
+```bash
+python scripts/generate_qa_candidates.py \
+  --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline \
+  --config config/qa/qa_generation.default.json \
+  --limit-num-files 3 \
+  --log-level DEBUG
+```
+
+## 6.4 Schritt 4: Qualitätssicherung der Q/A-Sätze
 
 Ziele:
 
