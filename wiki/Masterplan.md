@@ -161,36 +161,51 @@ Die Lösung besteht aus folgenden Hauptkomponenten:
    - Fine-Tuning großer Modelle (LLM) auf DACHS mit dem Q/A-Datensatz (Instruction-Tuning).
    - Bereitstellung der Modelle für Inferenz auf GPU-Knoten (Batch/Service, je nach Setup).
 
-### 3.2 Datenflüsse
+## 3.2 Gesamtübersicht der Pipeline (aktualisierte Fassung)
 
-1. **Rohdaten → normalized documents**  
-   - Kopieren von Rohdaten in thematische Workspaces.
-   - Ausführen von Normalisierungs-Skripten (z. B. `normalize_pdfs.py`, `normalize_excels.py`).
-   - Ergebnis: JSON-Dateien pro Dokument oder pro Chunk im Ordner `normalized/`.
+Die Verarbeitungspipeline für einen Workspace (z. B. `es_phdoeble-rag_pipeline`) besteht aus folgenden Hauptschritten:
 
-2. **normalized documents → semantic documents**  
-   - Ausführen von Anreicherungs-Skripten (z. B. `annotate_semantics.py`), die LLMs auf DACHS (GPU-Partitionen) verwenden.
-   - Anreicherung mit `content_type`, `domain`, `artifact_role`, `trust_level` und weiteren Attributen.
-   - Ergebnis: JSON-Dateien im Ordner `semantic/`.
+1. **Ingestion (`raw/ → normalized/json/`)**  
+   - Rohdokumente (PDF, DOCX, etc.) werden eingelesen, in Text überführt und in ein einheitliches JSON/JSONL-Schema gebracht.  
+   - Ergebnis: pro Quelle eine Datei unter `normalized/json/`, in der **jedes Chunk als JSON-Objekt** vorliegt (bei JSONL: eine Zeile = ein Chunk).
 
-3. **semantic documents → Q/A-Kandidaten**  
-   - Ausführen von Q/A-Generator-Skripten (z. B. `generate_qa_candidates.py`).
-   - Nutzung großer LLMs (per SLURM-Jobs) zur generischen und aufgabenorientierten Generierung von Instruction-Triples.
-   - Ergebnis: JSONL-Dateien mit Q/A-Kandidaten im Ordner `qa_candidates/`.
+2. **Normalisierung & Basis-Metadaten (`normalized/json/`)**  
+   - Vereinheitlichung von Feldern wie `doc_id`, `chunk_id`, `source_type`, `language`, Seiten-/Abschnittsangaben usw.  
+   - Sicherstellen, dass **jedes Chunk** eine eindeutige `chunk_id` und eine `doc_id` besitzt (Pflichtfelder).  
+   - Optional: erste heuristische Labels (z. B. „Titel“, „Abschnittsüberschrift“, „Fließtext“).
 
-4. **Q/A-Kandidaten → Q/A-Finaldatensatz**  
-   - Qualitätssicherung (automatische Checks, Filter, ggf. später manuelle Review).
-   - Aggregation in einen konsolidierten Trainingsdatensatz im Ordner `qa_final/`.
+3. **Semantische Anreicherung (`normalized/json/ → semantic/json/`)**  
+   - LLM-basierte Anreicherung der Chunks, z. B.:
+     - `chunk_role` (exercise, explanation, derivation, table, figure, …),  
+     - domänenspezifische Labels / Taxonomie,  
+     - kurze Zusammenfassungen, Key-Quantities, Formeln.  
+   - Dieser Schritt kann bereits **Retrieval-Kontext** aus dem FAISS-Index nutzen (siehe unten), falls vorhanden.
 
-5. **semantic documents → Embeddings → RAG-Indizes**  
-   - Berechnung von Embeddings (Batch-Jobs) auf DACHS.
-   - Aufbau von FAISS/Chroma-Indizes im Ordner `indices/`.
-   - Bereitstellung der Indizes für KNIME (Lesen/Abfragen über KNIME-Nodes).
+4. **Kontext- und RAG-Indizes (`normalized/json/ → indices/faiss/`, optional `indices/chroma/`)**  
+   - Aufbau eines **globale(n) Chunk-Index** über alle normalisierten Chunks des Workspaces:  
+     - Skript: `scripts/embed_chunks.py`  
+     - Input: `normalized/json/`  
+     - Output:  
+       - `indices/faiss/contextual.index` (FAISS-Vektorindex),  
+       - `indices/faiss/contextual_meta.jsonl` (Metadaten je Vektor, inkl. `chunk_id`, `doc_id`, `source_path`, …).  
+   - Dieser Kontextindex wird von mehreren Schritten genutzt:
+     - Retrieval-unterstützte semantische Anreicherung (LLM bekommt Nachbar-Chunks als Zusatzkontext),  
+     - Q/A-Kandidaten-Generierung (Gruppenbildung mehrerer thematisch naher Chunks),  
+     - spätere RAG-Nutzung (z. B. KNIME, interaktive Assistenten).  
+   - Optional: weitere spezialisierte Indizes (z. B. nur über high-trust-Quellen) können darauf aufbauen.
 
-6. **Q/A-Finaldatensatz → Fine-Tuning → Modellbereitstellung**  
-   - Fine-Tuning großer Modelle mit den Q/A-Daten (Instruction-Tuning).
-   - Speicherung der Modellartefakte (Checkpoints, Adapter) in geeigneten Workspaces.
-   - Bereitstellung für Inferenz (z. B. via Ollama oder vLLM).
+5. **Q/A-Kandidaten-Generierung (`semantic/json/ → qa_candidates/jsonl/`)**  
+   - LLM erzeugt Frage–Antwort-Paare auf Basis von semantisch angereicherten Chunks und deren Nachbarschaft im Kontextindex.  
+   - Nutzung des FAISS-Index für Multi-Chunk-Kontext (z. B. Aufgabe + Erklärung + zentrale Formel).
+
+6. **Filterung & Qualitätssicherung (`qa_candidates/jsonl/ → qa_final/jsonl/`)**  
+   - Heuristische und LLM-basierte Filter (z. B. Konsistenzchecks, Dubletten, Verständlichkeit, Groundedness).  
+   - Optional: Verwendung des Kontextindex, um zu prüfen, ob Antworten wirklich im lokalen Kontext (Chunk + Nachbarn) verankert sind.
+
+7. **Training / Fine-Tuning & Serving**  
+   - Verwendung von `qa_final/jsonl/` für Instruction-Tuning bzw. Fine-Tuning domänenspezifischer Modelle (HuggingFace Transformers + PEFT/LoRA, o. Ä.).  
+   - Deployment/Serving auf DACHS bzw. lokal (z. B. über vLLM, Ollama, KNIME-Pipelines).
+
 
 ### 3.3 Bilingualität und Sprachmix
 
@@ -376,6 +391,58 @@ Chunks werden je nach Dateityp nach sinnvollen Einheiten geschnitten, z. B.:
 
 Das Schema der Felder bleibt für alle Dateitypen gleich, damit nachgelagerte Schritte (Semantik, Q/A, Embeddings) generisch implementiert werden können.
 
+### 4.1.1 Speicherformat
+
+Normalisierte Dokumente werden im Workspace unter
+
+```text
+normalized/json/
+```
+
+abgelegt. In der Praxis wird überwiegend das **JSON Lines-Format (`.jsonl`)** verwendet:
+
+- Pro Quell-Dokument eine Datei `pdf_<Titel>_<hash>.jsonl`  
+- **Eine Zeile = ein Chunk** (ein JSON-Objekt).
+- Alternativ können für kleine Tests oder Sonderfälle auch `.json`-Dateien genutzt werden (z. B. ein Dokument mit `chunks`-Liste).
+
+### 4.1.2 Chunk-Schema (pro JSON-Objekt / Zeile)
+
+Jede Zeile einer `.jsonl`-Datei entspricht einem Chunk und folgt einem einheitlichen Schema (Beispiel):
+
+```json
+{
+  "doc_id": "pdf_Incropera_2006_3fe640ba",
+  "chunk_id": "pdf_Incropera_2006_3fe640ba_c0260",
+  "source_type": "pdf",
+  "source_path": "Incropera 2006 - Fundamentals of Heat and Mass Transfer.pdf",
+  "page_range": [260, 261],
+  "title": "4.3.2 Convection from a Flat Plate",
+  "content": "Der eigentliche Text dieses Chunks ...",
+  "language": "de",
+  "meta": {
+    "section": "Chapter 4",
+    "subsection": "4.3 External Flow",
+    "keywords": ["convection", "flat plate", "boundary layer"]
+  },
+  "semantic": {
+    "chunk_role": null,
+    "content_type": null,
+    "domain": null
+  }
+}
+```
+
+Wichtige Punkte:
+
+- **`doc_id` (Pflicht)**: eindeutige Dokument-ID, konsistent mit vorherigen Pipeline-Schritten (Ingestion).  
+- **`chunk_id` (Pflicht)**: eindeutige Chunk-ID, global im Workspace einzigartig. Sie wird u. a. als Schlüssel im FAISS-Index verwendet.  
+- **`content` (Pflicht)**: der eigentliche Text des Chunks (i. d. R. ein oder mehrere Sätze, ggf. auch Formeln/Tabellen als Textrepräsentation).  
+- **`source_path`**: Originalquelle (z. B. PDF-Dateiname), optional mit Zusatzinfos.  
+- **`semantic`**: Platzhalter für spätere semantische Anreicherung (LLM), initial meist `null` oder leer.
+
+Die oben gezeigte JSON-Struktur entspricht **genau einem Eintrag in einer `.jsonl`-Datei**. Eine Datei besteht dann aus vielen dieser Zeilen.
+
+---
 
 ### 4.2 Metadaten-Schema
 
@@ -878,62 +945,124 @@ python scripts/ingest_pdfs.py   --input-dir  /beegfs/scratch/workspace/<workspac
 
 Andere `ingest_*`-Skripte folgen demselben Grundmuster (Einlesen aus `raw/`, Normalisierung nach `normalized/json/`), verwenden aber jeweils typ-spezifische Strategien für Chunking und Struktur (Slides, Tabellen, Code-Blöcke usw.).
 
-### 6.2 Schritt 2: Semantische Anreicherung
+## 6.2 Semantische Anreicherung (aktualisiert, inkl. Retrieval-Kontext)
 
-Ziele:
+Die semantische Anreicherung (`annotate_semantics.py`) liest normalisierte Chunks aus
 
-- Klassifikation jedes Chunks nach `content_type`, `domain`, `artifact_role`, `trust_level`.
-- Optionale Extration weiterer semantischer Informationen (z. B. erkannte Größen, Einheiten, Verweise).
+```text
+normalized/json/
+```
 
-Skript:
+und schreibt für jedes Chunk eine angereicherte Variante nach
 
-- `annotate_semantics.py`
+```text
+semantic/json/
+```
 
-Vorgehen:
+### 6.2.1 Ziel der Anreicherung
 
-- Skript liest `normalized/json/` ein.
-- Für jeden Chunk wird eine Anfrage an ein lokales LLM (auf DACHS) gestellt:
-  - per Ollama/vLLM o. Ä. innerhalb eines SLURM-Jobs auf GPU-Knoten.
-- Die Antworten des LLM werden in den `semantic`-Block eingetragen.
-- Ergebnis wird in `semantic/json/` gespeichert (gleiche Struktur wie `normalized`, plus `semantic`).
+Für jeden Chunk werden u. a. folgende Felder befüllt/ergänzt:
 
-Konfiguration:
+- `semantic.chunk_role` – z. B. `exercise`, `explanation`, `definition`, `derivation`, `figure_caption`, …  
+- `semantic.content_type` – grober Dokument-/Inhaltstyp gemäß Taxonomie (z. B. `textbook`, `paper`, `guideline`, `software_handbook`).  
+- `semantic.domain` / `semantic.topic_tags` – domänenspezifische Schlagwörter oder Kategorien.  
+- `semantic.summary_short` – sehr kurze, chunk-spezifische Zusammenfassung.  
+- optional: extrahierte Formeln, Größenlisten, Referenzen.
 
-- Modellname, Prompt-Templates und Klassifikationslogik werden zentral konfiguriert, damit sie für alle Workspaces einheitlich sind.
-- Bei Bedarf können Workspaces spezifische Zusatzregeln erhalten (z. B. für GT-Power).
+### 6.2.2 LLM-Aufruf mit optionalem Retrieval-Kontext
 
-### 6.3 Schritt 3: Q/A-Kandidaten-Generierung
+Statt jeden Chunk isoliert zu betrachten, kann (und sollte) die Anreicherung **Retrieval-Kontext** aus dem globalen FAISS-Index nutzen:
 
-Ziele:
+- Vor dem LLM-Call wird für das aktuelle Chunk per `chunk_id` die Einbettung im Index nachgeschlagen.  
+- Über `faiss.search` werden die **Top-k ähnlichsten Chunks** (z. B. `k=3`) ermittelt.  
+- Zusätzlich können *lokale Nachbarn* im gleichen Dokument berücksichtigt werden (z. B. vorheriger/nächster Chunk oder gleiche `page_range`).  
+- Aus den Nachbarn werden kurze Textausschnitte gebildet (z. B. Titel + erste Sätze), die **als Kontext** dem LLM-Prompt hinzugefügt werden.
 
-- Automatische Generierung von Frage–Antwort-Beispielen aus `semantic/json/`.
-- Fokus auf die definierten Core-Tasks:
-  - Auslegung von Kühlsystemen,
-  - Skripting in Python und KNIME,
-  - Kommunikation mit Konzern-Infrastruktur,
-  - Hilfestellung bei GT-Power,
-  - Verständnis von Entwicklungsabläufen,
-  - Korrelation von Daten.
+Der Prompt für die Anreicherung enthält damit typischerweise:
 
-Skript:
+1. **Ziel-Chunk** (voller Text).  
+2. **Liste von Kurzkontexten** aus ähnlichen Chunks, z. B.:  
+   - „Ähnliche Stelle 1 (doc_id, kurzer Auszug) …“  
+   - „Ähnliche Stelle 2 …“  
+3. Klare Anweisungen, wie `chunk_role`, `content_type`, `summary_short` usw. zu erzeugen sind.
 
-- `generate_qa_candidates.py`
+Konfigurierbare Parameter (z. B. in `config/pipeline/semantic_config.json`):
 
-Vorgehen:
+- `use_retrieval_for_semantics: true|false`  
+- `neighbors_k: int` (z. B. 3)  
+- `similarity_threshold: float` (optional, um sehr schwache Nachbarn zu verwerfen)  
+- `max_context_chars_per_neighbor` (z. B. 500 Zeichen pro Nachbar).
 
-- Skript liest `semantic/json/` ein und bildet aus semantisch passenden Chunks Gruppen (z. B. Messdaten + Norm + Simulationsergebnis).
-- Für jede Gruppe wird ein Prompt an ein LLM formuliert, das:
-  - eine oder mehrere `instruction`-Fragen,
-  - dazu passende `input`-Kontexte,
-  - und `output`-Antworten erzeugt.
-- Die generierten Q/A-Beispiele werden im oben definierten Format nach `qa_candidates/jsonl/` geschrieben.
+### 6.2.3 Ein- und Ausgabeformate
 
-Konfigurierbare Aspekte:
+- **Input:** Chunks aus `normalized/json/` (JSON/JSONL, Schema siehe 4.1).  
+- **Output:** Angereicherte Chunks mit gefülltem `semantic`-Block unter `semantic/json/`, gleiche `doc_id`/`chunk_id`.
 
-- Anzahl Q/A-Beispiele pro Chunk-Gruppe.
-- Ziel-Difficulty (`junior`, `senior_engineer` usw.).
-- Sprache der Fragen/Antworten (abhängig von den Ursprungsdokumenten und Zielnutzung).
-- Maximal zulässige Länge von `input` und `output`.
+Der FAISS-Kontextindex selbst wird aus den normalisierten Chunks aufgebaut (`scripts/embed_chunks.py`, siehe Abschnitt 6.5.1) und steht dann für alle Anreicherungsschritte zur Verfügung.
+
+---
+
+## 6.3 Generierung von Q/A-Kandidaten (aktualisiert, FAISS-basiert)
+
+Die Q/A-Kandidaten-Generierung (`generate_qa_candidates.py`) nutzt semantisch annotierte Chunks aus
+
+```text
+semantic/json/
+```
+
+und erzeugt erste Frage–Antwort-Paare, die nachgelagert gefiltert werden.
+
+### 6.3.1 Grundidee
+
+- Ein einzelner Chunk eignet sich oft nur für **einfache** Fragen.  
+- Viele interessante Fragen beziehen sich auf **mehrere** zusammenhängende Passagen (z. B. Theorie + Beispiel + Randbedingung).  
+- Deshalb werden **Gruppen von Chunks** gebildet, aus denen das LLM jeweils mehrere Q/A-Paare ableiten kann.
+
+### 6.3.2 Gruppenbildung mit Semantik + FAISS-Nachbarschaft
+
+Für jeden Kandidatenchunk wird eine Gruppe aus mehreren Chunks gebildet, typischerweise:
+
+- Startpunkt: ein Chunk mit interessanter `chunk_role` (z. B. `exercise`, `explanation`, `definition`, `derivation`).  
+- Hinzunahme von:
+  - **lokalen Nachbarn** im gleichen Dokument (vorher/nachher, gleiche Section oder `page_range`),  
+  - **semantisch ähnlichen Chunks** über den FAISS-Kontextindex (`indices/faiss/contextual.index`).
+
+Konkrete Heuristik (Beispiel):
+
+1. Wähle einen „zentralen“ Chunk `C` mit bestimmten `semantic.chunk_role`-Werten (z. B. `exercise`).  
+2. Suche Top-k Nachbarn über FAISS (z. B. `k=5`).  
+3. Filtere diese Nachbarn:
+   - gleiche oder verwandte `semantic.domain`,  
+   - gleiche `doc_id` bevorzugt,  
+   - bestimmte `content_type` (z. B. `textbook`, nicht `catalog`).  
+4. Ergänze 1–3 lokale Nachbarn vor/nach `C` im gleichen Dokument.
+
+Damit entsteht eine kleine **Kontextgruppe** von z. B. 3–8 Chunks, die dieselbe Fragestellung oder dasselbe Thema beleuchten.
+
+### 6.3.3 LLM-Prompt für Q/A-Generierung
+
+Der Prompt erhält:
+
+- Liste der Kontextchunks (mit `chunk_id`, `doc_id`, kurzem Label und Text).  
+- Eindeutige Anweisungen, z. B.:
+  - „Erzeuge 1–3 präzise Fragen, die *nur* mit den gegebenen Texten beantwortbar sind.“  
+  - „Gib zu jeder Frage eine prägnante, textnahe Antwort an.“  
+  - „Nutze Fachbegriffe und Symbolik exakt so, wie sie in den Texten vorkommen.“
+
+Die Ausgabe wird als JSONL nach
+
+```text
+qa_candidates/jsonl/
+```
+
+geschrieben, eine Zeile pro Q/A-Kandidat mit u. a.:
+
+- `question`, `answer`,  
+- Referenzen auf verwendete `chunk_id`s (`source_chunks: [ ... ]`),  
+- Metadaten (z. B. `doc_id`, `domain`, `difficulty` falls anwendbar).
+
+---
+
 
 ### 6.4 Schritt 4: Qualitätssicherung der Q/A-Sätze
 
@@ -961,52 +1090,82 @@ Ergebnis:
 
 - ein konsolidierter Datensatz, z. B. `qa_final_v1.jsonl` im Ordner `qa_final/jsonl/`.
 
-### 6.5 Schritt 5: Aufbau von RAG-Indizes
 
-Ziele:
+## 6.5 Aufbau von Vektorindizes (aufgeteilt in Kontext- und RAG-Indizes)
 
-- Aufbau von Vektorindices (FAISS/Chroma) auf Grundlage der semantischen Dokumente.
-- Bereitstellung für KNIME-Workflows.
+### 6.5.1 Kontextindex auf Chunk-Ebene (`embed_chunks.py`)
 
-Skript:
+Der **Kontextindex** ist der zentrale Vektorindex, der über *alle Chunks* eines Workspaces gelegt wird:
 
-- `build_indices.py`
+- Skript: `scripts/embed_chunks.py`  
+- Input: `normalized/json/` (inkl. `.jsonl`)  
+- Output:
+  - `indices/faiss/contextual.index` – FAISS-Index über alle Embeddings,  
+  - `indices/faiss/contextual_meta.jsonl` – Metadaten je Vektor.
 
-Vorgehen:
+Vorgehen (high level):
 
-- Lesen der Chunks aus `semantic/json/`.
-- Erzeugung von Embeddings:
-  - entweder direkt auf DACHS mit einem Embedding-Modell,
-  - oder Verwendung bereits vorhandener Embeddings (falls in einem separaten Schritt erzeugt).
-- Aufbau von:
-  - FAISS-Indizes im Ordner `indices/faiss/`,
-  - Chroma-Indizes im Ordner `indices/chroma/` (einschließlich persistentem Speicherformat).
+1. Alle Dateien unter `normalized/json/` durchlaufen (`.json` und `.jsonl`, `archive/` ignorieren).  
+2. Pro Chunk einen Textstring bilden (z. B. `title + "
 
-Metadaten:
+" + content`).  
+3. Embeddings mit einem Sentence-Transformer-Modell erzeugen (z. B. `all-mpnet-base-v2`).  
+4. Embeddings (optional L2-normalisiert) in einen FAISS-Index schreiben (z. B. `IndexFlatIP` für Cosine-Ähnlichkeit).  
+5. Metadaten (u. a. `doc_id`, `chunk_id`, `source_path`, `language`, `semantic`) parallel in einer JSONL-Datei speichern, in der Reihenfolge der Vektoren.
 
-- Einbettung von `content_type`, `domain`, `artifact_role`, `trust_level` als Metadaten im Index, damit sie bei Abfragen als Filter verwendet werden können.
+Dieser Kontextindex ist:
 
-### 6.6 Schritt 6: Instruction-Tuning / Fine-Tuning
+- **Lesend** zugänglich für andere Skripte (z. B. `faiss_retriever.py`),  
+- Grundlage für Retrieval-augmented Semantik- und Q/A-Schritte,  
+- Basis für KNIME-/RAG-Workflows.
 
-Ziele:
+### 6.5.2 Zusätzliche RAG-Indizes (optional)
 
-- Feinabstimmung großer Modelle auf die Q/A-Datensätze.
-- Optimierung auf die definierten Core-Tasks und den gewünschten Kommunikationsstil.
+Neben dem globalen Kontextindex können weitere spezialisierte Indizes aufgebaut werden, z. B.:
 
-Vorgehen (high-level):
+- Index nur über Chunks aus bestimmten Quellen (`source_type`, `doc_id`-Whitelist).  
+- Index nur über „vertrauenswürdige“ Chunks (z. B. Normen, Lehrbücher).  
+- Index auf Dokumentebene (Aggregat-Embeddings pro Dokument oder Kapitel).
 
-- Auswahl eines Basismodells (z. B. ein großes offenes LLM, das lokal nutzbar ist).
-- Vorbereitung von Trainingssplit:
-  - Training / Validierung,
-  - optional später Testset aus manuell kuratierten Beispielen.
-- Konfiguration von Trainingsjobs:
-  - via SLURM auf GPU-Partitionen,
-  - mit geeigneten Hyperparametern (Batch-Größe, Lernrate, Kontextlänge etc.).
+Ein generisches Skript (Platzhalter: `build_indices.py`) kann auf Basis von:
 
-Ergebnis:
+- `semantic/json/`  
+- oder bereits produzierten `qa_final/jsonl/`
 
-- Modellartefakte (Checkpoints, Adapter) werden in einem dedizierten Workspace abgelegt.
-- Diese Modelle können später über einen geeigneten Inferenzserver (z. B. Ollama, vLLM) auf DACHS bereitgestellt und von KNIME / Jupyter / internen Tools genutzt werden.
+solche Indizes aufbauen. Dabei können Embeddings wiederverwendet werden (z. B. Einlesen aus `contextual_meta.jsonl` + Subset-Selektion), um Rechenzeit zu sparen.
+
+---
+
+## 6.6 (optional) Labelpropagation & Nachbarschafts-Konsistenz
+
+Dieser Abschnitt ist optional, beschreibt aber sinnvolle FAISS-basierte Erweiterungen.
+
+### 6.6.1 Labelpropagation
+
+Nach der ersten semantischen Anreicherung können über den Kontextindex einfache *Labelpropagation*-Strategien umgesetzt werden:
+
+- Für jeden Chunk:
+  - Hole Top-k Nachbarn aus dem Kontextindex.  
+  - Betrachte z. B. deren `semantic.chunk_role` und `semantic.content_type`.  
+- Wenn ein Chunk kein Label hat, aber ≥80 % seiner Nachbarn ein konsistentes Label tragen, kann dieses Label vorgeschlagen oder automatisch übernommen werden.  
+- Falls ein Chunk ein Label hat, seine Nachbarn aber überwiegend ein anderes Label tragen, kann er als **inkonsistent** markiert werden (Flag für manuelle Prüfung).
+
+Implementierbar als separates Skript, z. B.:
+
+```text
+scripts/label_propagation.py
+```
+
+### 6.6.2 QA-Konsistenz-Check über Nachbarschaft
+
+Für generierte Q/A-Kandidaten kann der Kontextindex ebenfalls zur **Qualitätssicherung** eingesetzt werden:
+
+- Zu jeder Frage–Antwort-Kombination sind die verwendeten `source_chunks` bekannt.  
+- Über den Kontextindex lassen sich weitere Nachbarn dieser Chunks finden.  
+- Ein LLM- oder regelbasierter Check kann prüfen, ob die Antwort tatsächlich im Umfeld dieser Chunks verankert ist (Groundedness).  
+- Q/A-Paare, die sich durch keinen der Nachbarn stützen lassen, können verworfen oder zur manuellen Prüfung flaggen.
+
+Ein solches Skript könnte z. B. `scripts/qa_consistency_filter.py` heißen und zwischen `qa_candidates/jsonl/` und `qa_final/jsonl/` laufen.
 
 ---
 
@@ -1044,6 +1203,43 @@ Ergebnis:
 
 - Nutzung von Environment Modules und/oder Conda-Umgebungen für reproduzierbare Laufzeitumgebungen.
 - Dokumentation der Abhängigkeiten (z. B. `requirements.txt`, `environment.yml`) je Pipeline-Stufe.
+
+## 7.5 Konfiguration & Jobs (Ergänzungen)
+
+### 7.5.1 Embedding-Konfiguration
+
+Neue Konfigurationsdatei (Beispiel):
+
+```text
+config/pipeline/embeddings.json
+```
+
+mit u. a.:
+
+```json
+{
+  "model_name": "sentence-transformers/all-mpnet-base-v2",
+  "batch_size": 64,
+  "device": "cuda",
+  "normalize_embeddings": true,
+  "index_name": "contextual.index",
+  "meta_name": "contextual_meta.jsonl"
+}
+```
+
+### 7.5.2 SLURM-Job für Embeddings
+
+Jobskript:
+
+```text
+jobs/embed_chunks.slurm
+```
+
+- liest `workspace_root` aus `config/paths/paths.json`,  
+- sorgt dafür, dass `indices/faiss/` und `logs/indices/` existieren,  
+- ruft `scripts/embed_chunks.py` mit der gewünschten Konfiguration auf (z. B. `--normalize`, optional `--max-chunks` für Tests).
+
+Dieses Jobskript lässt sich bei Bedarf später erweitern (z. B. um einen CPU-only-Modus oder andere Embedding-Modelle).
 
 ---
 

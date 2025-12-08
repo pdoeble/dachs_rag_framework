@@ -67,5 +67,5 @@ python scripts/annotate_semantics.py \
   --input-dir "$INPUT_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --config config/LLM/semantic_llm.json \
-  --limit-files 1 \
+  --limit-files 10000 \
   --verbose

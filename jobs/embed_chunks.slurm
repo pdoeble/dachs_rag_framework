@@ -52,4 +52,4 @@ mkdir -p "$WORKSPACE_ROOT/indices/faiss" \
 # Embeddings für alle Chunks erzeugen
 python scripts/embed_chunks.py \
   --workspace-root "$WORKSPACE_ROOT" \
-  --verbose
+

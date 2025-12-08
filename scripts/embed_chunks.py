@@ -5,22 +5,23 @@ embed_chunks.py
 Erstellt Dense-Embeddings für alle normalisierten Chunks in einem Workspace
 und baut daraus einen FAISS-Vektorindex.
 
-Annahmen:
-- Workspace-Struktur wie im Masterplan beschrieben:
+Unterstützt:
+- .json (ein Dokument oder Liste von Chunks)
+- .jsonl (JSON Lines: jede Zeile ein Dokument/Chunk)
+
+Workspace-Struktur:
   <workspace_root>/
     normalized/json/     # Eingabe (Chunks)
     indices/faiss/       # Ausgabe (Index + Metadaten)
     logs/                # Logfiles
 
-Verwendung (Beispiel):
+Beispiel:
   python embed_chunks.py \
       --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline \
       --model-name sentence-transformers/all-mpnet-base-v2 \
       --batch-size 64 \
-      --device cuda
-
-Hinweis:
-- Dieses Skript baut den Index *neu* auf und überschreibt vorhandene Dateien.
+      --device cuda \
+      --normalize
 """
 
 import argparse
@@ -64,7 +65,6 @@ def setup_logging(workspace_root: str) -> logging.Logger:
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
-    # File-Handler (DEBUG)
     fh = logging.FileHandler(logfile, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     ffmt = logging.Formatter(
@@ -74,7 +74,6 @@ def setup_logging(workspace_root: str) -> logging.Logger:
     fh.setFormatter(ffmt)
     logger.addHandler(fh)
 
-    # Console-Handler (INFO)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     cfmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
@@ -85,23 +84,21 @@ def setup_logging(workspace_root: str) -> logging.Logger:
     return logger
 
 
-def iter_normalized_json_files(normalized_root: str, logger: logging.Logger) -> Generator[str, None, None]:
+def iter_normalized_files(normalized_root: str, logger: logging.Logger) -> Generator[str, None, None]:
     """
-    Liefert Pfade zu allen .json-Dateien unter normalized_root,
-    außer unterordnern namens 'archive'.
+    Liefert Pfade zu allen .json- und .jsonl-Dateien unter normalized_root,
+    außer Unterordnern namens 'archive'.
     """
     if not os.path.isdir(normalized_root):
-        logger.error("Verzeichnis für normalisierte JSONs existiert nicht: %s", normalized_root)
+        logger.error("Verzeichnis für normalisierte Dateien existiert nicht: %s", normalized_root)
         return
 
     for root, dirs, files in os.walk(normalized_root):
-        # 'archive' Unterordner überspringen
         dirs[:] = [d for d in dirs if d.lower() != "archive"]
-
         for fname in files:
-            if not fname.lower().endswith(".json"):
-                continue
-            yield os.path.join(root, fname)
+            lower = fname.lower()
+            if lower.endswith(".json") or lower.endswith(".jsonl"):
+                yield os.path.join(root, fname)
 
 
 def extract_chunks_from_doc(
@@ -115,11 +112,9 @@ def extract_chunks_from_doc(
     Unterstützte Formen:
     - Ein einzelnes Chunk-Objekt (dict mit 'content' etc.)
     - Eine Liste von Chunk-Objekten (list[dict])
-
-    Gibt Tupel (chunk_dict, source_path) zurück.
+    - Ein Dokument mit Feld 'chunks': list[dict]
     """
     if isinstance(doc, dict):
-        # Einzelner Chunk (oder Dokument mit 'chunks'-Liste)
         if "content" in doc:
             yield doc, source_path
         elif "chunks" in doc and isinstance(doc["chunks"], list):
@@ -139,7 +134,6 @@ def extract_chunks_from_doc(
                 type(doc),
             )
     elif isinstance(doc, list):
-        # Liste von Chunks
         for chunk in doc:
             if isinstance(chunk, dict) and "content" in chunk:
                 yield chunk, source_path
@@ -160,16 +154,11 @@ def extract_chunks_from_doc(
 def build_text_from_chunk(chunk: Dict[str, Any]) -> str:
     """
     Erzeugt den Text, der in den Embedding-Encoder geht.
-
-    Einfache Heuristik:
-    - Falls 'title' vorhanden: title + zwei Zeilenumbrüche + content
-    - Sonst nur content
     """
     title = chunk.get("title")
     content = chunk.get("content", "")
 
     if not isinstance(content, str):
-        # Sicherstellen, dass wir immer einen String haben
         content = str(content)
 
     if title and isinstance(title, str):
@@ -183,10 +172,10 @@ def collect_chunks(
     max_chunks: int | None = None,
 ) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
     """
-    Lädt alle Chunks aus normalized/json und sammelt:
+    Lädt alle Chunks aus normalized/json (inkl. .jsonl) und sammelt:
     - Texte (für Embeddings)
-    - Metadaten pro Chunk (doc_id, chunk_id, source_path, etc.)
-    - Chunk-IDs (separat für bequemeren Zugriff)
+    - Metadaten pro Chunk
+    - Chunk-IDs
 
     max_chunks: wenn gesetzt, begrenzt die Anzahl der geladenen Chunks.
     """
@@ -197,60 +186,124 @@ def collect_chunks(
     num_files = 0
     num_chunks = 0
 
-    for fpath in iter_normalized_json_files(normalized_root, logger):
+    for fpath in iter_normalized_files(normalized_root, logger):
         num_files += 1
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-        except Exception as exc:
-            logger.warning("Konnte Datei nicht laden (%s): %s", fpath, exc)
-            continue
+        lower = fpath.lower()
 
-        for chunk, source_path in extract_chunks_from_doc(doc, fpath, logger):
-            # Sicherheitschecks
-            doc_id = chunk.get("doc_id")
-            c_id = chunk.get("chunk_id")
-
-            if not doc_id or not c_id:
-                # Ohne IDs ist der Chunk in der Pipeline praktisch nutzlos
-                logger.debug(
-                    "Chunk ohne doc_id/chunk_id in %s – überspringe.",
-                    source_path,
-                )
+        if lower.endswith(".json"):
+            # ganze Datei als JSON laden
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception as exc:
+                logger.warning("Konnte JSON-Datei nicht laden (%s): %s", fpath, exc)
                 continue
 
-            text = build_text_from_chunk(chunk)
-            if not text.strip():
-                # Leere Chunks brauchen wir nicht
+            for chunk, source_path in extract_chunks_from_doc(doc, fpath, logger):
+                doc_id = chunk.get("doc_id")
+                c_id = chunk.get("chunk_id")
+                if not doc_id or not c_id:
+                    logger.debug(
+                        "Chunk ohne doc_id/chunk_id in %s – überspringe.",
+                        source_path,
+                    )
+                    continue
+
+                text = build_text_from_chunk(chunk)
+                if not text.strip():
+                    continue
+
+                meta: Dict[str, Any] = {
+                    "doc_id": doc_id,
+                    "chunk_id": c_id,
+                    "source_path": source_path,
+                    "source_type": chunk.get("source_type"),
+                    "language": chunk.get("language"),
+                    "meta": chunk.get("meta", {}),
+                    "semantic": chunk.get("semantic", {}),
+                }
+
+                texts.append(text)
+                metas.append(meta)
+                chunk_ids.append(str(c_id))
+                num_chunks += 1
+
+                if max_chunks is not None and num_chunks >= max_chunks:
+                    logger.info(
+                        "Maximale Anzahl Chunks erreicht (%d) – Abbruch der Sammlung.",
+                        max_chunks,
+                    )
+                    logger.info(
+                        "Geladene Dateien: %d, gesammelte Chunks: %d",
+                        num_files,
+                        num_chunks,
+                    )
+                    return texts, metas, chunk_ids
+
+        elif lower.endswith(".jsonl"):
+            # JSON Lines: jede Zeile ein Dokument / Chunk
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line_no, line in enumerate(f, start=1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            doc = json.loads(line)
+                        except Exception as exc:
+                            logger.warning(
+                                "Fehler beim Parsen von JSONL (%s:%d): %s",
+                                fpath,
+                                line_no,
+                                exc,
+                            )
+                            continue
+
+                        source_path = f"{fpath}:{line_no}"
+                        for chunk, _ in extract_chunks_from_doc(doc, source_path, logger):
+                            doc_id = chunk.get("doc_id")
+                            c_id = chunk.get("chunk_id")
+                            if not doc_id or not c_id:
+                                logger.debug(
+                                    "Chunk ohne doc_id/chunk_id in %s – überspringe.",
+                                    source_path,
+                                )
+                                continue
+
+                            text = build_text_from_chunk(chunk)
+                            if not text.strip():
+                                continue
+
+                            meta = {
+                                "doc_id": doc_id,
+                                "chunk_id": c_id,
+                                "source_path": source_path,
+                                "source_type": chunk.get("source_type"),
+                                "language": chunk.get("language"),
+                                "meta": chunk.get("meta", {}),
+                                "semantic": chunk.get("semantic", {}),
+                            }
+
+                            texts.append(text)
+                            metas.append(meta)
+                            chunk_ids.append(str(c_id))
+                            num_chunks += 1
+
+                            if max_chunks is not None and num_chunks >= max_chunks:
+                                logger.info(
+                                    "Maximale Anzahl Chunks erreicht (%d) – Abbruch der Sammlung.",
+                                    max_chunks,
+                                )
+                                logger.info(
+                                    "Geladene Dateien: %d, gesammelte Chunks: %d",
+                                    num_files,
+                                    num_chunks,
+                                )
+                                return texts, metas, chunk_ids
+
+            except Exception as exc:
+                logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)
                 continue
-
-            meta: Dict[str, Any] = {
-                "doc_id": doc_id,
-                "chunk_id": c_id,
-                "source_path": source_path,
-                # Optionale Felder aus dem Chunk übernehmen, wenn vorhanden
-                "source_type": chunk.get("source_type"),
-                "language": chunk.get("language"),
-                "meta": chunk.get("meta", {}),
-                "semantic": chunk.get("semantic", {}),
-            }
-
-            texts.append(text)
-            metas.append(meta)
-            chunk_ids.append(c_id)
-            num_chunks += 1
-
-            if max_chunks is not None and num_chunks >= max_chunks:
-                logger.info(
-                    "Maximale Anzahl Chunks erreicht (%d) – Abbruch der Sammlung.",
-                    max_chunks,
-                )
-                logger.info(
-                    "Geladene Dateien: %d, gesammelte Chunks: %d",
-                    num_files,
-                    num_chunks,
-                )
-                return texts, metas, chunk_ids
 
     logger.info(
         "Sammlung abgeschlossen. Dateien: %d, Chunks: %d",
@@ -266,10 +319,7 @@ def build_faiss_index(
     logger: logging.Logger,
 ) -> faiss.Index:
     """
-    Erstellt einen FAISS-Index vom Typ IndexFlatIP (Inner Product) oder IndexFlatL2.
-
-    embeddings: numpy-Array der Form (N, D)
-    use_inner_product: True => IndexFlatIP, False => IndexFlatL2
+    Erstellt einen FAISS-Index vom Typ IndexFlatIP oder IndexFlatL2.
     """
     if embeddings.ndim != 2:
         raise ValueError(f"Embeddings müssen 2D sein, erhalten: {embeddings.shape}")
@@ -279,12 +329,11 @@ def build_faiss_index(
 
     if use_inner_product:
         index = faiss.IndexFlatIP(dim)
-        logger.info("FAISS Index-Typ: IndexFlatIP (inner product)")
+        logger.info("FAISS Index-Typ: IndexFlatIP (inner product / Cosine bei Normalisierung)")
     else:
         index = faiss.IndexFlatL2(dim)
         logger.info("FAISS Index-Typ: IndexFlatL2 (L2-Distanz)")
 
-    # Sicherheit: auf float32 casten
     vecs32 = embeddings.astype("float32")
     index.add(vecs32)
 
@@ -310,13 +359,9 @@ def save_meta_lines(meta_path: str, metas: List[Dict[str, Any]], logger: logging
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
-    """
-    Parsed die Kommandozeilenargumente.
-    """
     parser = argparse.ArgumentParser(
         description="Erzeuge FAISS-Index aus normalisierten Chunks (Embeddings)."
     )
-
     parser.add_argument(
         "--workspace-root",
         required=True,
@@ -359,7 +404,6 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default="contextual_meta.jsonl",
         help="Dateiname für die Metadaten-JSONL unter indices/faiss/.",
     )
-
     return parser.parse_args(argv)
 
 
@@ -374,11 +418,10 @@ def main(argv: List[str] | None = None) -> int:
 
     logger = setup_logging(workspace_root)
     logger.info("Workspace-Root: %s", workspace_root)
-    logger.info("Normalized JSON Root: %s", normalized_root)
+    logger.info("Normalized Root: %s", normalized_root)
     logger.info("Index wird geschrieben nach: %s", index_path)
     logger.info("Metadaten werden geschrieben nach: %s", meta_path)
 
-    # Chunks einsammeln
     texts, metas, chunk_ids = collect_chunks(
         normalized_root=normalized_root,
         logger=logger,
@@ -389,14 +432,17 @@ def main(argv: List[str] | None = None) -> int:
         logger.error("Keine Chunks gefunden – Abbruch.")
         return 1
 
-    logger.info("Starte Embedding-Berechnung mit Modell '%s' auf Gerät '%s'.", args.model_name, args.device)
+    logger.info(
+        "Starte Embedding-Berechnung mit Modell '%s' auf Gerät '%s'.",
+        args.model_name,
+        args.device,
+    )
     try:
         model = SentenceTransformer(args.model_name, device=args.device)
     except Exception as exc:
         logger.error("Konnte SentenceTransformer-Modell nicht laden: %s", exc)
         return 1
 
-    # Embeddings erzeugen
     try:
         embeddings = model.encode(
             texts,
@@ -406,7 +452,6 @@ def main(argv: List[str] | None = None) -> int:
             normalize_embeddings=args.normalize,
         )
     except TypeError:
-        # Fallback für ältere sentence-transformers-Versionen ohne normalize_embeddings-Argument
         logger.warning(
             "SentenceTransformer.encode unterstützt 'normalize_embeddings' nicht, "
             "normalisiere manuell."
@@ -418,25 +463,26 @@ def main(argv: List[str] | None = None) -> int:
             show_progress_bar=True,
         )
         if args.normalize:
-            # L2-Normalisierung
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
             embeddings = embeddings / norms
 
     logger.info("Embeddings erstellt: Shape = %s", embeddings.shape)
 
-    # Index bauen
     use_ip = bool(args.normalize)
     index = build_faiss_index(embeddings, use_inner_product=use_ip, logger=logger)
 
-    # Index speichern
     os.makedirs(indices_root, exist_ok=True)
     faiss.write_index(index, index_path)
     logger.info("FAISS-Index in %s gespeichert.", index_path)
 
-    # Metadaten speichern
     save_meta_lines(meta_path, metas, logger)
 
-    logger.info("Fertig. Vektoren: %d, Index: %s, Meta: %s", len(metas), index_path, meta_path)
+    logger.info(
+        "Fertig. Vektoren: %d, Index: %s, Meta: %s",
+        len(metas),
+        index_path,
+        meta_path,
+    )
     return 0
 
 
