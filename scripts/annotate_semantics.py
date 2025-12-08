@@ -31,6 +31,10 @@ Erweitertes Logging:
 - Gibt Fortschritt in der Form [aktuell/gesamt] aus.
 - Schreibt Zeitstempel in den Log.
 - Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
+
+Sharding:
+- Die Menge der Eingabedateien kann über (--num-shards, --shard-id) auf mehrere
+  Jobs (z. B. SLURM-Array) verteilt werden.
 """
 
 from __future__ import annotations
@@ -44,7 +48,6 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 import importlib.util
 
@@ -76,7 +79,6 @@ REPO_ROOT = paths_utils.REPO_ROOT  # gleiche Logik wie in paths_utils.py
 # Taxonomie- und LLM-Konfig-Pfade im Repo
 TAXONOMY_DIR = REPO_ROOT / "config" / "taxonomy"
 LLM_CONFIG_PATH = REPO_ROOT / "config" / "LLM" / "semantic_llm.json"
-
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +722,18 @@ def main() -> None:
         action="store_true",
         help="Mehr Logging ausgeben.",
     )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Gesamtzahl der Shards (Array-Jobs).",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Shard-Index dieses Jobs (0-basiert).",
+    )
 
     args = parser.parse_args()
 
@@ -739,6 +753,13 @@ def main() -> None:
     if not llm_config_path.is_file():
         raise SystemExit(f"LLM-Konfigurationsdatei fehlt: {llm_config_path}")
 
+    if args.num_shards < 1:
+        raise SystemExit(f"--num-shards muss >= 1 sein, erhalten: {args.num_shards}")
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise SystemExit(
+            f"--shard-id muss im Bereich [0, {args.num_shards - 1}] liegen, erhalten: {args.shard_id}"
+        )
+
     llm_config = load_json_file(llm_config_path)
     taxonomies = load_taxonomies()
     classifier = LLMSemanticClassifier(llm_config)
@@ -747,12 +768,39 @@ def main() -> None:
     logging.info("Output: %s", output_dir)
     logging.info("LLM   : %s @ %s", classifier.model, classifier.base_url)
 
-    files = sorted(input_dir.glob("*.jsonl"))
+    # Vollständige Dateiliste
+    files_all = sorted(input_dir.glob("*.jsonl"))
     if args.limit_files is not None:
-        files = files[: args.limit_files]
+        files_all = files_all[: args.limit_files]
+
+    if not files_all:
+        logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
+        return
+
+    # Sharding anwenden: einfacher Modulo-Split über den Index
+    if args.num_shards == 1:
+        files = files_all
+    else:
+        files = [
+            f for idx, f in enumerate(files_all)
+            if idx % args.num_shards == args.shard_id
+        ]
+
+    logging.info(
+        "Sharding-Konfiguration: num_shards=%d, shard_id=%d, files_total=%d, files_in_this_shard=%d",
+        args.num_shards,
+        args.shard_id,
+        len(files_all),
+        len(files),
+    )
 
     if not files:
-        logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
+        logging.warning(
+            "Shard %d hat keine Dateien zu verarbeiten (num_shards=%d, files_total=%d).",
+            args.shard_id,
+            args.num_shards,
+            len(files_all),
+        )
         return
 
     for in_file in files:
