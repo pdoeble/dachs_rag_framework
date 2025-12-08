@@ -312,9 +312,10 @@ einfachen FAISS-Index-Aufbau + Query.
 /home/es/es_es/es_phdoeble
 ├─ dachs_rag_framework/          # RAG-Framework (Git-Repo, Codebasis)
 │  ├─ config/                    # Konfigurationen
+│  │  ├─ taxonomy/               # Taxonomien, Label-Schemata
 │  │  ├─ LLM/                    # Modell-/LLM-Settings
 │  │  ├─ pipeline/               # Pipeline-Config (Stages, Pfade)
-│  │  └─ taxonomy/               # Taxonomien, Label-Schemata
+│  │  └─ qa/                     # Q & A Settings
 │  ├─ env/                       # Env-/Setup-Skripte
 │  ├─ jobs/                      # SLURM-Jobskripte (*.slurm)
 │  ├─ logs/                      # Framework-Logs (nicht die Daten-Logs)
@@ -987,29 +988,55 @@ Für jeden Chunk werden u. a. folgende Felder befüllt/ergänzt:
 - `semantic.summary_short` – sehr kurze, chunk-spezifische Zusammenfassung.  
 - optional: extrahierte Formeln, Größenlisten, Referenzen.
 
-### 6.2.2 LLM-Aufruf mit optionalem Retrieval-Kontext
+#### 6.2.2 LLM-Aufruf mit optionalem Retrieval-Kontext
 
-Statt jeden Chunk isoliert zu betrachten, kann (und sollte) die Anreicherung **Retrieval-Kontext** aus dem globalen FAISS-Index nutzen:
+Statt jeden Chunk isoliert zu betrachten, kann (und sollte) die semantische Anreicherung **Retrieval-Kontext** aus dem globalen FAISS-Kontextindex nutzen.
 
-- Vor dem LLM-Call wird für das aktuelle Chunk per `chunk_id` die Einbettung im Index nachgeschlagen.  
-- Über `faiss.search` werden die **Top-k ähnlichsten Chunks** (z. B. `k=3`) ermittelt.  
-- Zusätzlich können *lokale Nachbarn* im gleichen Dokument berücksichtigt werden (z. B. vorheriger/nächster Chunk oder gleiche `page_range`).  
-- Aus den Nachbarn werden kurze Textausschnitte gebildet (z. B. Titel + erste Sätze), die **als Kontext** dem LLM-Prompt hinzugefügt werden.
+Technischer Weg:
 
-Der Prompt für die Anreicherung enthält damit typischerweise:
+- Für jeden Ziel-Chunk `C` ist `chunk_id` eindeutig in `semantic/json/` vergeben.
+- Über den Helfer `FaissRetriever` (Modul `scripts/faiss_retriever.py`) wird der Kontextindex geladen:
+  - `contextual.index` (FAISS-Index),
+  - `contextual_meta.jsonl` (Metadaten mit `faiss_id`, `chunk_id`, `doc_id`, `semantic`, …).
+- Der Retriever bildet intern eine Map `chunk_id → faiss_id` und führt über FAISS eine k-NN-Suche durch.
 
-1. **Ziel-Chunk** (voller Text).  
-2. **Liste von Kurzkontexten** aus ähnlichen Chunks, z. B.:  
-   - „Ähnliche Stelle 1 (doc_id, kurzer Auszug) …“  
-   - „Ähnliche Stelle 2 …“  
-3. Klare Anweisungen, wie `chunk_role`, `content_type`, `summary_short` usw. zu erzeugen sind.
+Ablauf bei aktiviertem Retrieval (z. B. `use_retrieval_for_semantics = true` in `config/pipeline/semantic_config.json`):
 
-Konfigurierbare Parameter (z. B. in `config/pipeline/semantic_config.json`):
+1. **Ziel-Chunk bestimmen**  
+   - `annotate_semantics.py` iteriert über alle Chunks in `normalized/json/` (bzw. über bereits existierende Einträge in `semantic/json/` bei Wiederaufnahme).
+
+2. **Nachbarn über FAISS holen**  
+   - Für `chunk_id` von `C` ruft das Skript den Retriever auf, z. B.:
+     - `neighbors = retriever.get_neighbors_for_chunk(chunk_id=C.chunk_id, top_k=K, include_self=False)`
+   - Der Retriever liefert eine Liste von Treffern mit:
+     - `faiss_id`, `score` (Ähnlichkeit/Distanz, je nach Index),
+     - `chunk_id`, `doc_id`, `source_path`, `semantic`, `meta`, `trust_level`, `content_type`, `domain`, …
+
+3. **Nachbarn filtern / kürzen**  
+   - Optional werden Nachbarn verworfen, wenn:
+     - der `score` unter einen Schwellwert fällt (`similarity_threshold`),
+     - `trust_level` nicht zu gewünschten Werten gehört (z. B. nur „high“),
+     - `content_type` und `domain` nicht zum Ziel-Chunk passen.
+   - Zusätzlich können *lokale Nachbarn* im gleichen Dokument hinzugezogen werden (z. B. vorheriger/nächster Chunk oder gleiche `page_range`).
+
+4. **Prompt-Kontext zusammenbauen**  
+   - Aus jedem Nachbar-Chunk wird ein kurzer Ausschnitt (z. B. ein oder zwei Sätze, begrenzt durch `max_context_chars_per_neighbor`) in Klartext extrahiert.
+   - Der LLM-Prompt erhält:
+     1. den **Ziel-Chunk** (voller Text),
+     2. eine **Liste von Kurzkontexten** aus Nachbar-Chunks (mit knapper Quellenangabe, z. B. `doc_id`, `chunk_id`),
+     3. klare Anweisungen, wie `semantic.*`-Felder (Rollen, Labels, `summary_short`, …) zu setzen sind.
+
+Typische Konfigurationsparameter (z. B. in `semantic_config.json`):
 
 - `use_retrieval_for_semantics: true|false`  
-- `neighbors_k: int` (z. B. 3)  
+- `neighbors_k: int` (z. B. 3–5)  
 - `similarity_threshold: float` (optional, um sehr schwache Nachbarn zu verwerfen)  
-- `max_context_chars_per_neighbor` (z. B. 500 Zeichen pro Nachbar).
+- `max_context_chars_per_neighbor: int` (z. B. 500)  
+- optionale Filterlisten für `trust_level`, `content_type`, `domain`  
+
+Wenn `use_retrieval_for_semantics = false` gesetzt ist, arbeitet `annotate_semantics.py` nur mit dem Ziel-Chunk und ggf. einfachen lokalen Nachbarn (keine FAISS-Abfrage).
+
+---
 
 ## 6.2.3 Ein- und Ausgabeformate
 
@@ -1048,24 +1075,46 @@ und erzeugt erste Frage–Antwort-Paare, die nachgelagert gefiltert werden.
 
 ### 6.3.2 Gruppenbildung mit Semantik + FAISS-Nachbarschaft
 
-Für jeden Kandidatenchunk wird eine Gruppe aus mehreren Chunks gebildet, typischerweise:
+Für jeden ausgewählten Kandidaten-Chunk wird eine **Kontextgruppe** aus mehreren Chunks gebildet, aus der das LLM anschließend mehrere Frage–Antwort-Paare ableitet.
 
-- Startpunkt: ein Chunk mit interessanter `chunk_role` (z. B. `exercise`, `explanation`, `definition`, `derivation`).  
-- Hinzunahme von:
-  - **lokalen Nachbarn** im gleichen Dokument (vorher/nachher, gleiche Section oder `page_range`),  
-  - **semantisch ähnlichen Chunks** über den FAISS-Kontextindex (`indices/faiss/contextual.index`).
+Diese Gruppenbildung nutzt:
 
-Konkrete Heuristik (Beispiel):
+- die semantischen Labels in `semantic/*` (z. B. `chunk_role`, `domain`, `content_type`, `trust_level`),
+- den globalen Kontextindex (`contextual.index`),
+- den Helfer `FaissRetriever` für FAISS-Abfragen.
 
-1. Wähle einen „zentralen“ Chunk `C` mit bestimmten `semantic.chunk_role`-Werten (z. B. `exercise`).  
-2. Suche Top-k Nachbarn über FAISS (z. B. `k=5`).  
-3. Filtere diese Nachbarn:
-   - gleiche oder verwandte `semantic.domain`,  
-   - gleiche `doc_id` bevorzugt,  
-   - bestimmte `content_type` (z. B. `textbook`, nicht `catalog`).  
-4. Ergänze 1–3 lokale Nachbarn vor/nach `C` im gleichen Dokument.
+Ablauf (Beispielschema):
 
-Damit entsteht eine kleine **Kontextgruppe** von z. B. 3–8 Chunks, die dieselbe Fragestellung oder dasselbe Thema beleuchten.
+1. **Kandidatenchunk `C` wählen**  
+   - z. B. Chunks mit bestimmten `semantic.chunk_role`-Werten (`exercise`, `example`, `key_result`, …),
+   - Mindest-`trust_level` (z. B. nicht `low`).
+
+2. **Semantische Nachbarn über FAISS holen**  
+   - Über `FaissRetriever.get_neighbors_for_chunk(chunk_id=C.chunk_id, top_k=K)` werden die `K` ähnlichsten Chunks bestimmt.
+   - `FaissRetriever` liefert für jeden Treffer Metadaten plus `score`, `faiss_id`, `chunk_id`, `doc_id`.
+
+3. **Nachbarn filtern**  
+   - Es werden nur Nachbarn behalten, die z. B. folgende Kriterien erfüllen:
+     - gleiche oder verwandte `semantic.domain` (fachliche Nähe),
+     - bevorzugt gleiche `doc_id` (lokaler Zusammenhang),
+     - passende `content_type` (z. B. `textbook`, nicht `catalog`),
+     - ggf. ausreichender `trust_level`.
+   - Optional: harte Grenze auf `score` (`similarity_threshold`).
+
+4. **Lokale Nachbarn ergänzen**  
+   - Zusätzlich zu FAISS-Nachbarn werden 1–3 lokale Nachbarn im gleichen Dokument berücksichtigt:
+     - vorherige / folgende Chunks,
+     - Chunks mit gleicher Section-ID oder `page_range`.
+
+5. **Kontextgruppe bauen**  
+   - Aus `C` + gefilterten FAISS-Nachbarn + lokalen Nachbarn entsteht eine Gruppe von z. B. 3–8 Chunks.
+   - Diese Gruppe wird als strukturierter Input für den Q/A-LLM-Prompt aufbereitet:
+     - Liste von Chunks mit `chunk_id`, `doc_id`, kurzer Textzusammenfassung oder Ausschnitt,
+     - klare Instruktion an das LLM, welche Arten von Fragen/Antworten erzeugt werden sollen (z. B. konzeptionelle vs. Rechenfragen).
+
+Die eigentliche Q/A-Generierung (`generate_qa_candidates.py`) arbeitet dann gruppenweise und schreibt die erzeugten Frage–Antwort-Paare nach `qa_candidates/jsonl/`, inklusive Referenzen auf alle beteiligten `chunk_id`s und deren `doc_id`s.
+
+---
 
 ### 6.3.3 LLM-Prompt für Q/A-Generierung
 
@@ -1193,6 +1242,85 @@ Ein generisches Skript (Platzhalter: `embed_chunks.py`) kann auf Basis von:
 solche Indizes aufbauen. Dabei können Embeddings wiederverwendet werden (z. B. Einlesen aus `contextual_meta.jsonl` + Subset-Selektion), um Rechenzeit zu sparen.
 
 ---
+
+
+### 6.5.3 Retrieval-API auf FAISS-Basis (`faiss_retriever.py`)
+
+Der Kontextindex aus 6.5.1 wird für Semantik (6.2) und Q/A (6.3) über ein zentrales Helfermodul angebunden:
+
+- Modul/Skript: `scripts/faiss_retriever.py`  
+- Kernklasse: `FaissRetriever`  
+
+**Aufgaben von `FaissRetriever`:**
+
+- Laden des Kontextindex aus einem Workspace:
+  - `indices/faiss/contextual.index`,
+  - `indices/faiss/contextual_meta.jsonl`.
+- Aufbau einer Map `chunk_id → faiss_id` aus den Metadaten.
+- Konsistenzprüfung:
+  - Anzahl Metadatensätze == `index.ntotal`.
+- Bereitstellen von Methoden für:
+  - Lookup der Indexposition (`faiss_id`) zu einer gegebenen `chunk_id`,
+  - Rekonstruktion einzelner Vektoren,
+  - k-NN-Suche in „Chunk-Space“ für einen gegebenen Chunk.
+
+**Zentrales API (Python):**
+
+```python
+from scripts.faiss_retriever import FaissRetriever
+
+retriever = FaissRetriever(workspace_root="/beegfs/scratch/workspace/es_phdoeble-rag_pipeline")
+
+# 1) faiss_id zu chunk_id
+faiss_id = retriever.get_faiss_id_for_chunk("some_chunk_id")
+
+# 2) Vektor rekonstruieren (FLAT-Index)
+vec = retriever.reconstruct_vector(faiss_id)  # Shape: (1, dim)
+
+# 3) Nachbarn für einen Chunk holen
+neighbors = retriever.get_neighbors_for_chunk(
+    chunk_id="some_chunk_id",
+    top_k=5,
+    include_self=False,
+)
+```
+
+Jeder Eintrag in `neighbors` ist ein Dict mit:
+
+- `faiss_id` – Indexposition im FAISS-Index,
+- `score` – Distanz oder Ähnlichkeit (abhängig vom Index-Typ),
+- `chunk_id`, `doc_id`, `source_path`, `source_type`, `language`,
+- `meta`, `semantic`,
+- flachen Convenience-Feldern (`trust_level`, `content_type`, `domain`), falls in `contextual_meta.jsonl` vorhanden.
+
+**Backward-Kompatibilität:**
+
+- Ältere Indizes, deren Meta-Datei noch `vector_id` statt `faiss_id` enthält, werden weiterhin unterstützt:
+  - `FaissRetriever` liest `faiss_id` **oder** `vector_id` und behandelt beide als Indexposition.
+
+**CLI-Testmodus:**
+
+Das Skript kann direkt von der Kommandozeile genutzt werden, um Nachbarn für eine gegebene `chunk_id` zu inspizieren:
+
+```bash
+python scripts/faiss_retriever.py     --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline     --chunk-id SOME_CHUNK_ID     --top-k 5
+```
+
+Ausgabe (Beispiel, pro Treffer eine Zeile):
+
+- Score (Distanz/Ähnlichkeit),
+- `faiss_id`,
+- `doc_id`,
+- `chunk_id`,
+- `source_path`.
+
+**Nutzung in anderen Modulen:**
+
+- `annotate_semantics.py`:
+  - nutzt `FaissRetriever.get_neighbors_for_chunk(...)`, um Retrieval-Kontext für die semantische Anreicherung zu holen.
+- `generate_qa_candidates.py`:
+  - nutzt denselben Retriever für die Bildung semantischer Kontextgruppen (ähnliche Chunks + lokale Nachbarn).
+- Optionale weitere Komponenten (z. B. KNIME-Workflows, Analyse-Skripte) können ebenfalls über `FaissRetriever` auf den Kontextindex zugreifen, ohne selbst FAISS- und Meta-Handling implementieren zu müssen.
 
 ## 6.6 (optional) Labelpropagation & Nachbarschafts-Konsistenz
 
