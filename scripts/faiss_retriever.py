@@ -36,7 +36,7 @@ class FaissRetriever:
     Kapselt:
     - Laden des FAISS-Index
     - Laden der JSONL-Metadaten
-    - Mapping chunk_id -> vector_id
+    - Mapping chunk_id -> faiss_id (Indexposition)
     - Nachbarschaftssuche pro Chunk
     """
 
@@ -61,45 +61,63 @@ class FaissRetriever:
 
         # Metadaten laden
         self.meta: List[Dict[str, Any]] = []
-        self.chunkid_to_vectorid: Dict[str, int] = {}
+        # Primäre Map: chunk_id -> faiss_id (Indexposition)
+        self.chunkid_to_faissid: Dict[str, int] = {}
 
         with open(self.meta_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 rec = json.loads(line)
-                vec_id = rec.get("vector_id")
+
+                # Neues Schema: faiss_id
+                faiss_id = rec.get("faiss_id")
+                # Fallback auf altes Schema: vector_id (für ältere Indizes)
+                if faiss_id is None:
+                    faiss_id = rec.get("vector_id")
+
                 chunk_id = rec.get("chunk_id")
-                if vec_id is None or chunk_id is None:
+
+                if faiss_id is None or chunk_id is None:
+                    # unvollständiger Record -> überspringen
                     continue
+
+                faiss_id_int = int(faiss_id)
+
                 self.meta.append(rec)
-                self.chunkid_to_vectorid[str(chunk_id)] = int(vec_id)
+                self.chunkid_to_faissid[str(chunk_id)] = faiss_id_int
 
         if len(self.meta) != self.index.ntotal:
             raise RuntimeError(
                 f"Anzahl Metadaten ({len(self.meta)}) ungleich Index-Vektoren ({self.index.ntotal})."
             )
 
-    def get_vector_id_for_chunk(self, chunk_id: str) -> int:
+    def get_faiss_id_for_chunk(self, chunk_id: str) -> int:
         """
-        Gibt die vector_id (Indexposition) für eine gegebene chunk_id zurück.
+        Gibt die faiss_id (Indexposition im FAISS-Index) für eine gegebene chunk_id zurück.
         """
         try:
-            return self.chunkid_to_vectorid[chunk_id]
+            return self.chunkid_to_faissid[chunk_id]
         except KeyError as exc:
             raise KeyError(f"chunk_id nicht im Index gefunden: {chunk_id}") from exc
 
-    def reconstruct_vector(self, vector_id: int) -> np.ndarray:
+    def get_vector_id_for_chunk(self, chunk_id: str) -> int:
         """
-        Rekonstruiert den Vektor zu einer gegebenen vector_id aus dem Index.
+        Alias für get_faiss_id_for_chunk, für Rückwärtskompatibilität.
+        """
+        return self.get_faiss_id_for_chunk(chunk_id)
+
+    def reconstruct_vector(self, faiss_id: int) -> np.ndarray:
+        """
+        Rekonstruiert den Vektor zu einer gegebenen faiss_id aus dem Index.
 
         Funktioniert für FLAT-Indizes (IndexFlatIP / IndexFlatL2), wie in embed_chunks.py verwendet.
         """
-        if vector_id < 0 or vector_id >= self.index.ntotal:
-            raise IndexError(f"Ungültige vector_id: {vector_id}")
+        if faiss_id < 0 or faiss_id >= self.index.ntotal:
+            raise IndexError(f"Ungültige faiss_id: {faiss_id}")
 
-        vec = self.index.reconstruct(vector_id)
+        vec = self.index.reconstruct(faiss_id)
         return np.asarray(vec, dtype="float32").reshape(1, -1)
 
     def get_neighbors_for_chunk(
@@ -112,14 +130,14 @@ class FaissRetriever:
         Liefert die Top-k Nachbar-Chunks für eine gegebene chunk_id.
 
         Rückgabe: Liste von Dicts mit:
-          - 'score'  (Ähnlichkeit oder Distanz, je nach Index)
-          - 'vector_id'
+          - 'score'    (Ähnlichkeit oder Distanz, je nach Index)
+          - 'faiss_id' (Indexposition im FAISS-Index)
           - alle Metadaten aus contextual_meta.jsonl
 
         Wenn include_self=False, wird der Chunk selbst aus den Ergebnissen entfernt.
         """
-        vector_id = self.get_vector_id_for_chunk(chunk_id)
-        query_vec = self.reconstruct_vector(vector_id)
+        faiss_id = self.get_faiss_id_for_chunk(chunk_id)
+        query_vec = self.reconstruct_vector(faiss_id)
 
         # Wir holen bewusst etwas mehr und filtern ggf. uns selbst raus
         k_search = top_k + (0 if include_self else 1)
@@ -130,7 +148,7 @@ class FaissRetriever:
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0:
                 continue
-            if not include_self and idx == vector_id:
+            if not include_self and idx == faiss_id:
                 continue
 
             if idx >= len(self.meta):
@@ -139,7 +157,7 @@ class FaissRetriever:
 
             rec = dict(self.meta[idx])  # Kopie
             rec["score"] = float(dist)
-            rec["vector_id"] = int(idx)
+            rec["faiss_id"] = int(idx)
             result.append(rec)
 
             if len(result) >= top_k:
@@ -170,7 +188,8 @@ def _cli_print_neighbors(
         nid = rec.get("chunk_id")
         score = rec.get("score")
         source_path = rec.get("source_path")
-        print(f"{i:2d}. score={score:.4f}  doc_id={doc_id}  chunk_id={nid}")
+        faiss_id = rec.get("faiss_id")
+        print(f"{i:2d}. score={score:.4f}  faiss_id={faiss_id}  doc_id={doc_id}  chunk_id={nid}")
         print(f"    source_path={source_path}")
 
 

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=annotate_incropera
+#SBATCH --job-name=annotate_semantics
 #SBATCH --partition=gpu1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/annotate_incropera_%j.out
+#SBATCH --time=23:59:00
+#SBATCH --array=0-5
+#SBATCH --output=logs/annotate_semantics_%A_%a.out
 
 # defensives Bash-Setup
 set -euo pipefail
@@ -18,6 +19,8 @@ module load devel/python/3.12.3-gnu-14.2 cs/ollama/0.12.2
 
 # Python-Umgebung aktivieren
 source "$HOME/venv/dachs_rag_312/bin/activate"
+
+# ins Repo wechseln
 cd "$HOME/dachs_rag_framework"
 
 # Log-Verzeichnis im Repo sicherstellen
@@ -55,17 +58,28 @@ EOF
 INPUT_DIR="${DACHS_PATHS[0]}"
 OUTPUT_DIR="${DACHS_PATHS[1]}"
 
-# Ollama-Server direkt im Job starten
+# Shard-Parameter aus dem Array-Bereich ableiten
+ARRAY_MIN=${SLURM_ARRAY_TASK_MIN:-0}
+ARRAY_MAX=${SLURM_ARRAY_TASK_MAX:-5}
+NUM_SHARDS=$((ARRAY_MAX - ARRAY_MIN + 1))
+SHARD_ID=$((SLURM_ARRAY_TASK_ID - ARRAY_MIN))
+
+echo "SLURM_ARRAY_TASK_ID = ${SLURM_ARRAY_TASK_ID}"
+echo "NUM_SHARDS          = ${NUM_SHARDS}"
+echo "SHARD_ID            = ${SHARD_ID}"
+
+# Ollama-Server im Job starten
 export OLLAMA_HOST="0.0.0.0:11434"
-ollama serve > "/tmp/ollama_${SLURM_JOB_ID}.log" 2>&1 &
+ollama serve > "/tmp/ollama_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log" 2>&1 &
 
 # kurz warten, bis der Server lauscht
 sleep 5
 
-# Annotation (hier 1 Datei – Incropera –, später --limit-files entfernen/variabel setzen)
+# Annotation starten (annotate_semantics.py mit Sharding)
 python scripts/annotate_semantics.py \
   --input-dir "$INPUT_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --config config/LLM/semantic_llm.json \
-  --limit-files 10000 \
+  --num-shards "$NUM_SHARDS" \
+  --shard-id "$SHARD_ID" \
   --verbose
