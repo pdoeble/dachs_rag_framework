@@ -612,6 +612,66 @@ def process_file(
 
                 prev_text = records[idx - 1]["content"] if idx > 0 else None
                 next_text = records[idx + 1]["content"] if idx + 1 < total else None
+                                # ------------------------------------------------------------
+                # RULE 1: Skip meaningless / structural chunks before LLM call
+                # ------------------------------------------------------------
+                import re
+
+                text_clean = content.strip()
+                is_heading = rec.get("meta", {}).get("has_heading", False)
+
+                # A) Viel zu kurz → keine Information
+                if len(text_clean) < 5:
+                    rec["language"] = "unknown"
+                    rec["semantic"] = {
+                        "content_type": [],
+                        "domain": [],
+                        "artifact_role": ["structural"],
+                        "trust_level": "low",
+                        "summary_short": "",
+                        "equations": [],
+                        "key_quantities": [],
+                        "chunk_role": ["heading"] if is_heading else []
+                    }
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    continue
+
+                # B) Nur Zahlen / Punkte / Bindestriche → Kapitelnummern
+                if re.fullmatch(r"[0-9.\- ]+", text_clean):
+                    rec["language"] = "unknown"
+                    rec["semantic"] = {
+                        "content_type": [],
+                        "domain": [],
+                        "artifact_role": ["structural"],
+                        "trust_level": "low",
+                        "summary_short": "",
+                        "equations": [],
+                        "key_quantities": [],
+                        "chunk_role": ["heading"] if is_heading else []
+                    }
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    continue
+
+                # C) typische strukturelle Labels wie Figure 3.1, Table 2.4
+                if re.match(r"^(Figure|Table|Fig\.|Tab\.)\s*\d", text_clean, re.IGNORECASE):
+                    rec["language"] = "unknown"
+                    rec["semantic"] = {
+                        "content_type": [],
+                        "domain": [],
+                        "artifact_role": ["structural"],
+                        "trust_level": "low",
+                        "summary_short": "",
+                        "equations": [],
+                        "key_quantities": [],
+                        "chunk_role": ["heading"] if is_heading else []
+                    }
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    continue
+
+                # ------------------------------------------------------------
+                # Ende RULE 1 (ab hier: LLM wird nur noch für echte Inhalte aufgerufen)
+                # ------------------------------------------------------------
+
 
                 llm_raw = classifier.classify_chunk(
                     text=content,
