@@ -612,7 +612,31 @@ def process_file(
 
                 prev_text = records[idx - 1]["content"] if idx > 0 else None
                 next_text = records[idx + 1]["content"] if idx + 1 < total else None
-                                # ------------------------------------------------------------
+
+                # ------------------------------------------------------------
+                # RULE 2: Expand context for heading-only chunks
+                # ------------------------------------------------------------
+                meta = rec.get("meta") or {}
+                is_heading = bool(meta.get("has_heading"))
+                text_clean = content.strip()
+
+                if is_heading and len(text_clean) < 80:
+                    context_parts: List[str] = []
+
+                    if idx + 1 < total:
+                        context_parts.append(records[idx + 1].get("content", ""))
+
+                    if idx + 2 < total:
+                        context_parts.append(records[idx + 2].get("content", ""))
+
+                    joined = "\n\n".join(p for p in context_parts if p)
+                    if joined:
+                        next_text = joined
+                # ------------------------------------------------------------
+                # Ende RULE 2 – ab hier haben Headings mehr Kontext im LLM-Prompt
+                # ------------------------------------------------------------
+
+                # ------------------------------------------------------------
                 # RULE 1: Skip meaningless / structural chunks before LLM call
                 # ------------------------------------------------------------
                 import re
@@ -671,7 +695,6 @@ def process_file(
                 # ------------------------------------------------------------
                 # Ende RULE 1 (ab hier: LLM wird nur noch für echte Inhalte aufgerufen)
                 # ------------------------------------------------------------
-
 
                 llm_raw = classifier.classify_chunk(
                     text=content,
@@ -743,7 +766,6 @@ def process_file(
         len(existing_by_chunk),
         annotated_new,
     )
-
 
 # ---------------------------------------------------------------------------
 # CLI
