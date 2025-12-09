@@ -710,6 +710,17 @@ def process_file(
                 else:
                     semantic = normalize_semantic_result(llm_raw, taxonomies)
 
+                    # DEFAULT artifact_role für strukturelle Chunks (Ticket 3)
+                    meta = rec.get("meta") or {}
+                    ar_list = semantic.get("artifact_role") or []
+                    if meta.get("has_heading"):
+                        if "heading" not in ar_list:
+                            ar_list.append("heading")
+                    if meta.get("has_table"):
+                        if "table" not in ar_list:
+                            ar_list.append("table")
+                    semantic["artifact_role"] = ar_list
+
                     # language auf oberster Ebene ebenfalls setzen
                     lang_existing = rec.get("language")
                     if not lang_existing or lang_existing == "unknown":
