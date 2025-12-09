@@ -721,6 +721,11 @@ def process_file(
                             ar_list.append("table")
                     semantic["artifact_role"] = ar_list
 
+                    # RULE 4: summary_short bei strukturellen / schwachen Chunks unterdrücken
+                    text_clean = content.strip()
+                    if meta.get("has_heading") or meta.get("has_table") or len(text_clean) < 40:
+                        semantic["summary_short"] = ""
+
                     # language auf oberster Ebene ebenfalls setzen
                     lang_existing = rec.get("language")
                     if not lang_existing or lang_existing == "unknown":
