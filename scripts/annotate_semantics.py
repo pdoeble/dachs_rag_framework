@@ -212,7 +212,15 @@ class LLMSemanticClassifier:
             "Your job is to assign semantic tags from a fixed taxonomy and to extract "
             "a short summary and structured information about equations.\n\n"
             "You MUST respond with a single JSON object only. No explanations, "
-            "no markdown, no surrounding text."
+            "no markdown, no surrounding text.\n\n"
+            "If the MAIN CHUNK contains no meaningful content (shorter than 5 characters, "
+            "or only punctuation, or only numbers), then:\n"
+            "- set language to \"unknown\",\n"
+            "- set all taxonomy lists (content_type, domain, artifact_role, chunk_role, key_quantities) to empty lists,\n"
+            "- set trust_level to \"low\" if available in the taxonomy, otherwise choose any valid ID,\n"
+            "- set summary_short to an empty string \"\",\n"
+            "- set equations to an empty list.\n"
+            "Do NOT invent semantics for such chunks."
         )
 
         # Basis-User-Prompt
@@ -340,7 +348,6 @@ Example (schema only, NOT the real answer):
 Now produce the JSON classification and enrichment for the MAIN CHUNK.
 """
 
-        # Ollama-Payload mit JSON-Mode + num_predict
         payload = {
             "model": self.model,
             "messages": [
@@ -349,9 +356,9 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
             ],
             "temperature": self.temperature,
             "stream": False,
-            "format": "json",  # zwingt das Modell, valides JSON auszugeben
+            "format": "json",
             "options": {
-                "num_predict": self.max_tokens,  # genug Platz, damit JSON nicht abgeschnitten wird
+                "num_predict": self.max_tokens,
             },
         }
 
@@ -372,6 +379,7 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
             return None
 
         return self._safe_parse_json(content)
+
 
     @staticmethod
     def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:

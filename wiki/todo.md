@@ -143,7 +143,7 @@ Akzeptanzkriterien
 
 system_prompt enthält eine Regel wie:
 
-If the MAIN CHUNK contains no meaningful content (less than 5 characters,
+If theft (less than 5 characters,
 only punctuation, or only numbers), return empty lists and an empty summary.
 
 
