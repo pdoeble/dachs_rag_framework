@@ -115,6 +115,8 @@ srun --partition=<cpu-partition> --cpus-per-task=8 --mem=32G --time=02:00:00 --p
 # Module laden
 module purge
 module load compiler/gnu
+module purge
+module load devel/python/3.12.3-gnu-14.2 cs/ollama/0.12.2
 # ggf. weitere Module: mpi/openmpi, python, jupyter/ai, ...
 
 # Debug-Infos (optional)
