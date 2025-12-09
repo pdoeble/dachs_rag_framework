@@ -532,7 +532,6 @@ def render_user_prompt(
     prompt = prompt.replace("{MAX_QA_PER_GROUP}", str(max_qa_per_group))
     return prompt
 
-
 def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
     """Lädt System- und User-Prompt aus Dateien, fällt ansonsten auf Default zurück."""
     paths = cfg.paths
@@ -555,25 +554,61 @@ def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
 
     if system_prompt is None:
         system_prompt = (
-            "You are an expert assistant for engineering and thermodynamics. "
-            "You receive small groups of technical document chunks and must create "
-            "non-trivial question–answer pairs strictly based on the provided text."
+            "You are an expert assistant for engineering, thermodynamics and numerical simulation. "
+            "Your task is to design exam-style and practice question–answer pairs strictly from small sets "
+            "of technical document chunks.\n\n"
+            "Core rules:\n"
+            "- Use only information that is explicitly present in the provided chunks. Never invent formulas, "
+            "  symbols, parameter values, assumptions or definitions that are not clearly stated there.\n"
+            "- Prefer non-trivial, conceptually rich questions over simple recall of isolated facts.\n"
+            "- When the text is ambiguous or incomplete, omit that aspect instead of guessing.\n"
+            "- Use the same technical terminology, symbols and notation as in the text (including Greek letters, "
+            "  indices, subscripts, units, etc.).\n"
+            "- Generate questions and answers in the same main language as the context (German vs. English).\n"
+            "- Keep answers precise, technically correct and as compact as possible while still fully answering the question.\n"
         )
 
     if user_template is None:
         user_template = (
-            "You are given a set of context chunks from technical documents.\n\n"
+            "You are given a set of context chunks from technical documents. Each chunk is labeled with a "
+            "chunk_id and doc_id so you can orient yourself, but you must NOT mention chunk_id or doc_id in the "
+            "questions or answers.\n\n"
             "{CONTEXT}\n\n"
-            "Based only on the information in these chunks, generate between 1 and "
-            "{MAX_QA_PER_GROUP} non-trivial question–answer pairs.\n"
-            "Return your answer as a JSON array, without any additional text, using this schema:\n"
+            "Your goals:\n"
+            "1. Based only on the information in these chunks, generate between 1 and {MAX_QA_PER_GROUP} "
+            "   high-quality, non-trivial question–answer pairs.\n"
+            "2. Focus on conceptual understanding, conditions of validity, relationships between quantities, "
+            "   assumptions, limitations and the physical or mathematical meaning of formulas.\n"
+            "3. When formulas, derivations or numerical relationships are present, you may ask for interpretation, "
+            "   explanation of steps or qualitative effects (\"what happens if …\"), but every step must be justified "
+            "   by the text.\n"
+            "4. Avoid purely trivial questions that simply restate a single sentence or definition without any deeper aspect.\n"
+            "5. Do not rely on outside knowledge: if something is not clearly stated in the chunks, you must NOT use it.\n\n"
+            "Question style guidelines:\n"
+            "- Questions and answers must be in the same main language as the context.\n"
+            "- Use precise technical wording and correct units.\n"
+            "- Questions should be self-contained: a student reading only the question (and answer) should not need to "
+            "  see the chunk labels.\n"
+            "- Vary difficulty: some questions can be basic, but prefer intermediate or advanced where the text allows it.\n\n"
+            "Difficulty label:\n"
+            "- For each pair, set \"difficulty\" to one of: \"basic\", \"intermediate\", \"advanced\".\n"
+            "- Use \"basic\" only for simple recall or direct application; \"intermediate\" for multi-step reasoning; "
+            "  \"advanced\" for subtle conditions, combined concepts or complex derivations.\n\n"
+            "Output format (very important):\n"
+            "- Return your answer as a JSON array ONLY, with no explanation, no comments and no extra text before or after.\n"
+            "- Each element of the array must be an object with exactly these required keys:\n"
+            "  - \"question\": string\n"
+            "  - \"answer\": string\n"
+            "  - \"difficulty\": \"basic\" | \"intermediate\" | \"advanced\"\n\n"
+            "Example of the required output structure:\n"
             "[\n"
-            '  {"question": "...", "answer": "...", "difficulty": "basic|intermediate|advanced"},\n'
-            "  ...\n"
+            "  {\"question\": \"...\", \"answer\": \"...\", \"difficulty\": \"intermediate\"},\n"
+            "  {\"question\": \"...\", \"answer\": \"...\", \"difficulty\": \"advanced\"}\n"
             "]\n"
         )
 
     return system_prompt, user_template
+
 
 
 # ---------------------------------------------------------------------------
