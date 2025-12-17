@@ -9,7 +9,7 @@ werden per LLM (Ollama) semantisch annotiert:
 - domain         (Liste von IDs aus config/taxonomy/domain.json)
 - artifact_role  (Liste von IDs aus config/taxonomy/artifact_role.json)
 - trust_level    (eine ID aus config/taxonomy/trust_level.json)
-- chunk_role     (optionale pädagogische Rolle des Chunks: definition, example, .)
+- chunk_role     (optionale pädagogische Rolle des Chunks: definition, example, ...)
 - language       (de/en/mixed/unknown)
 
 Zusätzliche angereicherte Felder:
@@ -19,22 +19,12 @@ Zusätzliche angereicherte Felder:
 
 Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben.
 
-Wiederaufnahmefähig:
-- Existiert bereits eine Ausgabedatei, werden vorhandene Records pro chunk_id
-  eingelesen.
-- Bereits annotierte Chunks (semantic.trust_level vorhanden) werden übersprungen.
-- Ist die Ausgabe für eine Datei bereits vollständig annotiert, wird sie komplett
-  übersprungen.
-
-Erweitertes Logging:
-- Zählt die Gesamtzahl der Records.
-- Gibt Fortschritt in der Form [aktuell/gesamt] aus.
-- Schreibt Zeitstempel in den Log.
-- Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
-
-Sharding:
-- Die Menge der Eingabedateien kann über (--num-shards, --shard-id) auf mehrere
-  Jobs (z. B. SLURM-Array) verteilt werden.
+Wichtige Aspekte:
+- robustes Error-Handling (HTTP-Ausfälle, JSON-Parsing, etc.)
+- Wiederaufnahme: falls semantic/json/*.jsonl bereits existiert, werden nur
+  fehlende Chunks ergänzt (über chunk_id + trust_level).
+- Headings, Tabellen, extrem kurze/strukturierte Chunks werden heuristisch
+  behandelt, ggf. ohne LLM-Aufruf.
 """
 
 from __future__ import annotations
@@ -54,15 +44,11 @@ import importlib.util
 
 import requests
 
-# ---------------------------------------------------------------------------
-# Pfade / Taxonomie laden (paths_utils per absolutem Pfad laden)
-# ---------------------------------------------------------------------------
-
-# Verzeichnis dieses Skripts: ./dachs_rag_framework/scripts
-THIS_DIR = Path(__file__).resolve().parent
-
-# Repo-Root: ./dachs_rag_framework
-REPO_ROOT = THIS_DIR.parent
+# Pfadberechnung:
+# Wir gehen davon aus, dass dieses Skript unter REPO_ROOT/scripts/ liegt.
+# Dann ist REPO_ROOT = dieses_file.parent.parent
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parent.parent
 
 # Absoluter Pfad zu config/paths/paths_utils.py
 PATHS_UTILS_PATH = REPO_ROOT / "config" / "paths" / "paths_utils.py"
@@ -81,15 +67,6 @@ REPO_ROOT = paths_utils.REPO_ROOT  # gleiche Logik wie in paths_utils.py
 TAXONOMY_DIR = REPO_ROOT / "config" / "taxonomy"
 LLM_CONFIG_PATH = REPO_ROOT / "config" / "LLM" / "semantic_llm.json"
 
-# Optional: Pfad zu faiss_retriever.py (für Retrieval-Kontext)
-FAISS_RETRIEVER_PATH = THIS_DIR / "faiss_retriever.py"
-FaissRetriever = None
-if FAISS_RETRIEVER_PATH.is_file():
-    spec_fr = importlib.util.spec_from_file_location("dachs_faiss_retriever", FAISS_RETRIEVER_PATH)
-    faiss_retriever_module = importlib.util.module_from_spec(spec_fr)
-    assert spec_fr.loader is not None
-    spec_fr.loader.exec_module(faiss_retriever_module)
-    FaissRetriever = getattr(faiss_retriever_module, "FaissRetriever", None)
 
 # ---------------------------------------------------------------------------
 # Pfade / Taxonomie laden
@@ -228,7 +205,8 @@ class LLMSemanticClassifier:
         )
 
         # Basis-User-Prompt
-        user_prompt = f"""We have a text CHUNK from a larger document.
+        user_prompt = f"""
+We have a text CHUNK from a larger document.
 
 Document title: "{doc_title}"
 
@@ -244,6 +222,7 @@ MAIN CHUNK TEXT:
                 user_prompt += f'\n[NEXT CHUNK]:\n\"\"\"{next_text}\"\"\"\n'
 
         user_prompt += """
+
 TASK:
 Classify ONLY the MAIN CHUNK according to the following taxonomy.
 Use ONLY IDs from the lists. If nothing clearly fits, use empty lists.
@@ -251,10 +230,10 @@ Use ONLY IDs from the lists. If nothing clearly fits, use empty lists.
 Allowed values:
 
 1) language (free choice, not from taxonomy):
-- "de"      : German
-- "en"      : English
-- "mixed"   : clearly mixed German/English
-- "unknown" : cannot be determined
+   - "de"      : German
+   - "en"      : English
+   - "mixed"   : clearly mixed German/English
+   - "unknown" : cannot be determined
 
 2) content_type (0–2 items from this list):
 """ + content_type_block + """
@@ -271,11 +250,13 @@ Allowed values:
 
         if chunk_role_block:
             user_prompt += """
+
 6) chunk_role (0–2 items from this list, pedagogical function of the MAIN CHUNK):
 """ + chunk_role_block + """
 """
 
         user_prompt += """
+
 Additionally, extract:
 
 7) summary_short:
@@ -437,7 +418,7 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
 
 # ---------------------------------------------------------------------------
 # Semantik anwenden / Validierung gegen Taxonomie
-#  ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 def normalize_semantic_result(
@@ -927,147 +908,123 @@ def main() -> None:
         help="Ausgabeverzeichnis für angereicherte JSONL-Dateien (semantic/json).",
     )
     parser.add_argument(
-        "--config",
+        "--log-level",
         type=str,
-        default=str(LLM_CONFIG_PATH),
-        help="Pfad zu semantic_llm.json (LLM-Konfiguration).",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log-Level (Standard: INFO).",
     )
     parser.add_argument(
-        "--limit-files",
-        type=int,
+        "--only-file",
+        type=str,
         default=None,
-        help="Optional: Anzahl Eingabedateien begrenzen (Debug).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Mehr Logging ausgeben.",
-    )
-    parser.add_argument(
-        "--num-shards",
-        type=int,
-        default=1,
-        help="Gesamtzahl der Shards (Array-Jobs).",
+        help="Optional: Nur diese eine Datei (Name) verarbeiten (Filter auf input-dir).",
     )
     parser.add_argument(
         "--shard-id",
         type=int,
-        default=0,
-        help="Shard-Index dieses Jobs (0-basiert).",
-    )
-    parser.add_argument(
-        "--faiss-index-dir",
-        type=str,
         default=None,
-        help="Optional: Pfad zu einem FAISS-Index-Verzeichnis; wenn gesetzt, wird Retrieval-Kontext genutzt.",
+        help="Optional: Shard-ID (0-basiert) für parallele Verarbeitung.",
     )
     parser.add_argument(
-        "--faiss-top-k",
+        "--num-shards",
         type=int,
-        default=4,
-        help="Anzahl ähnlicher Chunks, die pro MAIN CHUNK aus dem FAISS-Index geholt werden.",
+        default=None,
+        help="Optional: Anzahl Shards für parallele Verarbeitung. "
+        "Files werden deterministisch auf Shards aufgeteilt.",
     )
 
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
     )
 
-    input_dir = Path(args.input_dir).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    llm_config_path = Path(args.config).expanduser().resolve()
-
-    if not input_dir.is_dir():
-        raise SystemExit(f"Eingabeverzeichnis existiert nicht: {input_dir}")
-
-    if not llm_config_path.is_file():
-        raise SystemExit(f"LLM-Konfigurationsdatei fehlt: {llm_config_path}")
-
-    if args.num_shards < 1:
-        raise SystemExit(f"--num-shards muss >= 1 sein, erhalten: {args.num_shards}")
-    if args.shard_id < 0 or args.shard_id >= args.num_shards:
-        raise SystemExit(
-            f"--shard-id muss im Bereich [0, {args.num_shards - 1}] liegen, erhalten: {args.shard_id}"
-        )
-
-    llm_config = load_json_file(llm_config_path)
+    # Taxonomien + LLM-Konfig laden
+    logging.info("Lade Taxonomien aus %s", TAXONOMY_DIR)
     taxonomies = load_taxonomies()
+
+    logging.info("Lade LLM-Konfiguration aus %s", LLM_CONFIG_PATH)
+    llm_config = load_llm_config()
+
     classifier = LLMSemanticClassifier(llm_config)
 
-    # Optional: FAISS-Retriever initialisieren
-    faiss_retriever = None
-    if args.faiss_index_dir:
-        index_dir = Path(args.faiss_index_dir).expanduser().resolve()
-        if not index_dir.is_dir():
-            raise SystemExit(f"FAISS-Index-Verzeichnis existiert nicht: {index_dir}")
-        if FaissRetriever is None:
-            logging.error(
-                "FAISS-Index-Verzeichnis angegeben (%s), aber FaissRetriever konnte nicht geladen werden.",
-                index_dir,
-            )
-        else:
-            try:
-                faiss_retriever = FaissRetriever(index_dir=index_dir)
-                logging.info("FAISS-Retriever aktiviert mit Index-Verzeichnis: %s", index_dir)
-            except Exception as e:
-                logging.error("Konnte FaissRetriever nicht initialisieren: %s", e)
-                faiss_retriever = None
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
 
-    logging.info("Input : %s", input_dir)
-    logging.info("Output: %s", output_dir)
-    logging.info("LLM   : %s @ %s", classifier.model, classifier.base_url)
+    if not input_dir.is_dir():
+        logging.error("Input-Verzeichnis existiert nicht: %s", input_dir)
+        sys.exit(1)
 
-    # Vollständige Dateiliste
-    files_all = sorted(input_dir.glob("*.jsonl"))
-    if args.limit_files is not None:
-        files_all = files_all[: args.limit_files]
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not files_all:
-        logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
-        return
+    # Alle JSONL-Dateien im input_dir einsammeln
+    files_all = sorted(p for p in input_dir.glob("*.jsonl") if p.is_file())
 
-    # Sharding anwenden: einfacher Modulo-Split über den Index
-    if args.num_shards == 1:
-        files = files_all
+    if args.only_file:
+        files_all = [p for p in files_all if p.name == args.only_file]
+        if not files_all:
+            logging.error("Keine Datei '%s' im Eingabeverzeichnis gefunden.", args.only_file)
+            sys.exit(1)
+
+    # Sharding (einfaches Round-Robin über die sortierte Liste)
+    if args.shard_id is not None and args.num_shards is not None:
+        shard_id = args.shard_id
+        num_shards = args.num_shards
+        if shard_id < 0 or num_shards <= 0 or shard_id >= num_shards:
+            logging.error("Ungültige Shard-Konfiguration: shard_id=%d, num_shards=%d", shard_id, num_shards)
+            sys.exit(1)
+        files = [f for i, f in enumerate(files_all) if i % num_shards == shard_id]
+        logging.info(
+            "Shard %d/%d: Verarbeite %d Dateien (von gesamt %d).",
+            shard_id,
+            num_shards,
+            len(files),
+            len(files_all),
+        )
     else:
-        files = [
-            f for idx, f in enumerate(files_all)
-            if idx % args.num_shards == args.shard_id
-        ]
-
-    logging.info(
-        "Sharding-Konfiguration: num_shards=%d, shard_id=%d, files_total=%d, files_in_this_shard=%d",
-        args.num_shards,
-        args.shard_id,
-        len(files_all),
-        len(files),
-    )
+        files = files_all
+        logging.info("Verarbeite %d Dateien ohne Sharding.", len(files))
 
     if not files:
         logging.warning(
-            "Shard %d hat keine Dateien zu verarbeiten (num_shards=%d, files_total=%d).",
+            "Keine Dateien zu verarbeiten. (input_dir=%s, only_file=%s, shard_id=%s, num_shards=%s)",
+            input_dir,
+            args.only_file,
             args.shard_id,
             args.num_shards,
-            len(files_all),
         )
         return
+
+    # Job-weiter Fortschritt (nur für diesen Shard / diesen SLURM-Task)
+    job_total = 0
+    for p in files:
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                job_total += sum(1 for line in f if line.strip())
+        except Exception:
+            # Fehler wird später in process_file geloggt; hier nur best effort.
+            continue
+
+    if job_total <= 0:
+        # Fallback: zumindest Anzahl Dateien verwenden, damit ETA nicht crasht
+        job_total = len(files)
+
+    progress: Dict[str, Any] = {
+        "job_done": 0,
+        "job_total": job_total,
+        "job_start_time": time.time(),
+    }
 
     for in_file in files:
         rel = in_file.name
         out_file = output_dir / rel
-        process_file(
-            in_file,
-            out_file,
-            classifier,
-            taxonomies,
-            faiss_retriever=faiss_retriever,
-            faiss_top_k=args.faiss_top_k,
-        )
+        process_file(in_file, out_file, classifier, taxonomies, progress)
 
     logging.info("Semantische Anreicherung abgeschlossen.")
+
 
 if __name__ == "__main__":
     main()
