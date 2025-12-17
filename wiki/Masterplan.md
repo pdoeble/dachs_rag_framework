@@ -980,13 +980,18 @@ semantic/json/
 
 ### 6.2.1 Ziel der Anreicherung
 
-Für jeden Chunk werden u. a. folgende Felder befüllt/ergänzt:
+Für jeden Chunk werden u. a. folgende Felder befüllt/ergänzt:
 
-- `semantic.chunk_role` – z. B. `exercise`, `explanation`, `definition`, `derivation`, `figure_caption`, …  
-- `semantic.content_type` – grober Dokument-/Inhaltstyp gemäß Taxonomie (z. B. `textbook`, `paper`, `guideline`, `software_handbook`).  
-- `semantic.domain` / `semantic.topic_tags` – domänenspezifische Schlagwörter oder Kategorien.  
-- `semantic.summary_short` – sehr kurze, chunk-spezifische Zusammenfassung.  
-- optional: extrahierte Formeln, Größenlisten, Referenzen.
+- `semantic.chunk_role` – z. B. `exercise`, `explanation`, `definition`, `derivation`, `figure_caption`, …
+- `semantic.content_type` – grober Dokument-/Inhaltstyp gemäß Taxonomie (z. B. `textbook`, `paper`, `guideline`, `software_handbook`).
+- `semantic.domain` – domänenspezifische Kategorien / Themenbereiche.
+- `semantic.artifact_role` – Rolle des Chunks im Dokument (z. B. `statement`, `assumption`, `heading`, `table`, `figure_caption`).
+- `semantic.trust_level` – Zuverlässigkeit des Inhalts gemäß Taxonomie (z. B. `high`, `medium`, `low`).
+- `semantic.summary_short` – sehr kurze, chunk-spezifische Zusammenfassung; kann bei rein strukturellen Chunks bewusst leer sein.
+- `semantic.equations` – Liste erkannter Gleichungen inkl. Variablen, Beschreibung, Einheiten.
+- `semantic.key_quantities` – Liste der wichtigsten physikalischen / technischen Größen, die im Chunk vorkommen.
+
+Nicht alle Felder sind für jeden Chunk sinnvoll befüllbar. Insbesondere für rein strukturelle Chunks (Kapitelnummern, Tabellen-/Abbildungs-Labels, Layoutfragmente) werden `summary_short`, `content_type` und `domain` im Zweifel bewusst leer gelassen und nur einfache Rollen wie `artifact_role = ["structural"]` bzw. `["heading"]`, `["table"]` vergeben.
 
 #### 6.2.2 LLM-Aufruf mit optionalem Retrieval-Kontext
 
@@ -1026,6 +1031,22 @@ Ablauf bei aktiviertem Retrieval (z. B. `use_retrieval_for_semantics = true` in 
      2. eine **Liste von Kurzkontexten** aus Nachbar-Chunks (mit knapper Quellenangabe, z. B. `doc_id`, `chunk_id`),
      3. klare Anweisungen, wie `semantic.*`-Felder (Rollen, Labels, `summary_short`, …) zu setzen sind.
 
+Zusätzlich zur reinen Übergabe von Ziel-Chunk und optionalem FAISS-Kontext gelten folgende Heuristiken im LLM-Aufruf:
+
+- **Lokaler Heading-Kontext**:  
+  Kurze Überschriften-Chunks (`meta.has_heading = true` und `len(content) < 80`) werden nie isoliert betrachtet. Der LLM-Prompt erhält zusätzlich den Inhalt der folgenden 1–2 Chunks als „NEIGHBORING CONTEXT“. So können `domain`, `content_type` und `artifact_role` auch für reine Abschnittsüberschriften sinnvoll gesetzt werden.
+
+- **Regel für nicht-informative Chunks im Prompt**:  
+  Der System-Prompt enthält eine explizite Anweisung: Wenn der MAIN CHUNK praktisch keine Information trägt (weniger als 5 Zeichen oder nur Zahlen/Punkt/Interpunktion), soll das Modell
+  - `language = "unknown"`,
+  - leere Listen für `content_type`, `domain`, `artifact_role`, `chunk_role`, `key_quantities`,
+  - `trust_level = "low"` (oder ein anderer gültiger ID-Wert),
+  - `summary_short = ""` und `equations = []`
+  zurückgeben und **keine künstliche Semantik halluzinieren**.
+
+In Kombination mit den Skript-Heuristiken (siehe 6.2.4) sorgt das dafür, dass das LLM nur dort „verstehende“ Anreicherungen erzeugt, wo tatsächlich Inhalt vorhanden ist, und Layout-/Strukturfragmente konsistent als solche markiert werden.
+
+
 Typische Konfigurationsparameter (z. B. in `semantic_config.json`):
 
 - `use_retrieval_for_semantics: true|false`  
@@ -1055,6 +1076,56 @@ Der FAISS-Kontextindex selbst wird in der Regel aus den semantisch angereicherte
 
 zur Verfügung.
 
+Zusätzlich gelten folgende Konventionen für Sonderfälle im Output:
+
+- **Nicht-informative / strukturelle Chunks**  
+  Chunks, die praktisch keinen fachlichen Inhalt tragen (z. B. einzelne Punkte, reine Abschnittsnummern, Kapitelmarker wie „12.4.2“, reine Tabellen-/Abbildungslabels), werden bereits im Skript vor dem LLM-Aufruf erkannt. Für diese Chunks wird ohne LLM-Call ein minimalistischer `semantic`-Block gesetzt:
+
+  - `language = "unknown"`,
+  - `content_type = []`, `domain = []`,
+  - `artifact_role = ["structural"]` und ggf. zusätzlich `["heading"]` bzw. `["table"]` abhängig von `meta.has_heading` / `meta.has_table`,
+  - `summary_short = ""`,
+  - `equations = []`, `key_quantities = []`,
+  - `chunk_role = []` (oder `["heading"]` für reine Überschrift-Chunks).
+
+- **Kurztexte / Layoutfragmente**  
+  Für Chunks mit sehr kurzem Text (`len(content) < 40`) oder klarer Layout-Funktion (Heading, Table) dürfen `summary_short`, `content_type` und `domain` bewusst leer bleiben, auch wenn andere Chunks desselben Dokuments voll annotiert sind. Das ist eine gewünschte Design-Entscheidung und kein Qualitätsmangel.
+
+## 6.2.4 Heuristiken für strukturelle und schwache Chunks
+
+Um LLM-Kapazität nicht an layoutbedingte Fragmente zu verschwenden und die Statistiken interpretierbar zu halten, wendet `annotate_semantics.py` vor und nach dem LLM-Aufruf eine Reihe einfacher Heuristiken an:
+
+1. **Pre-Filter für „Müll-Chunks“ (kein LLM-Aufruf)**  
+   Ein Chunk wird gar nicht erst an das LLM geschickt, sondern direkt minimal annotiert, wenn eine der folgenden Bedingungen erfüllt ist:
+   - `len(content.strip()) < 5`, oder
+   - `content` besteht nur aus Ziffern, Punkten, Bindestrichen und Leerzeichen (typische Kapitelnummern), oder
+   - `content` ist ein einfaches Label wie „Figure 3.1“, „Table 2.4“ usw.
+
+   In diesen Fällen setzt das Skript:
+   - `language = "unknown"`,
+   - `artifact_role = ["structural"]` (ggf. plus `["heading"]`),
+   - alle anderen Listen (inkl. `content_type`, `domain`, `chunk_role`, `key_quantities`, `equations`) leer,
+   - `trust_level = "low"`.
+
+2. **Heading-spezifische Kontext-Erweiterung**  
+   Für Chunks mit `meta.has_heading = true` und kurzem Text (`len(content) < 80`) wird der LLM-Prompt um den Inhalt der folgenden 1–2 Chunks erweitert („NEIGHBORING CONTEXT“). Dadurch können Überschrift-Chunks sinnvoll mit `domain`, `content_type` und didaktischen Rollen (`chunk_role`) versehen werden, ohne dass der eigentliche Abschnitt in mehrere unabhängige Sinnfragmente zerfällt.
+
+3. **Default-Rollen für strukturelle Chunks**  
+   Nach dem LLM-Aufruf ergänzt das Skript `artifact_role` anhand der Metadaten:
+   - wenn `meta.has_heading = true` → `artifact_role` enthält mindestens `"heading"`,
+   - wenn `meta.has_table = true` → `artifact_role` enthält mindestens `"table"`.
+
+   Bereits vom LLM gesetzte Rollen werden nicht überschrieben, sondern nur ergänzt.
+
+4. **Unterdrückung von `summary_short` bei strukturellen / ultrakurzen Chunks**  
+   Für Chunks, die
+   - als Heading oder Table markiert sind (`meta.has_heading` / `meta.has_table`), oder
+   - nur sehr kurzen Text (`len(content) < 40`) enthalten,
+
+   setzt das Skript `semantic.summary_short` explizit auf den leeren String `""`, selbst wenn das LLM eine Mini-Zusammenfassung geliefert hat. Damit wird verhindert, dass Überschriften, Nummern oder Tabellenfragmente als „Inhalt“ erscheinen.
+
+5. **Konsistente LLM-Regeln für nicht-informative Chunks**  
+   Der System-Prompt des LLM enthält zusätzlich die Vorgabe, für klar nicht-informative MAIN CHUNKS (kurzer/leerzeichendominierter Text, nur Zahlen/Interpunktion) leere Taxonomie-Listen, `language = "unknown"`, `trust_level = "low"` und `summary_short = ""` zurückzugeben und keine Semantik zu halluzinieren. In Kombination mit dem Pre-Filter (1) sorgt das für robuste, deterministische Behandlung von Layout-Fragmenten.
 
 ## 6.3 Generierung von Q/A-Kandidaten (aktualisiert, FAISS-basiert)
 
