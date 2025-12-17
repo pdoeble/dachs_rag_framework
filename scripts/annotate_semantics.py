@@ -19,12 +19,22 @@ Zusätzliche angereicherte Felder:
 
 Ergebnis wird als identische JSONL-Struktur in semantic/json/ geschrieben.
 
-Wichtige Aspekte:
-- robustes Error-Handling (HTTP-Ausfälle, JSON-Parsing, etc.)
-- Wiederaufnahme: falls semantic/json/*.jsonl bereits existiert, werden nur
-  fehlende Chunks ergänzt (über chunk_id + trust_level).
-- Headings, Tabellen, extrem kurze/strukturierte Chunks werden heuristisch
-  behandelt, ggf. ohne LLM-Aufruf.
+Wiederaufnahmefähig:
+- Existiert bereits eine Ausgabedatei, werden vorhandene Records pro chunk_id
+  eingelesen.
+- Bereits annotierte Chunks (semantic.trust_level vorhanden) werden übersprungen.
+- Ist die Ausgabe für eine Datei bereits vollständig annotiert, wird sie komplett
+  übersprungen.
+
+Erweitertes Logging:
+- Zählt die Gesamtzahl der Records.
+- Gibt Fortschritt in der Form [aktuell/gesamt] aus.
+- Schreibt Zeitstempel in den Log.
+- Schätzt anhand des bisherigen Fortschritts eine ETA (voraussichtliche Fertigstellungszeit).
+
+Sharding:
+- Die Menge der Eingabedateien kann über (--num-shards, --shard-id) auf mehrere
+  Jobs (z. B. SLURM-Array) verteilt werden.
 """
 
 from __future__ import annotations
