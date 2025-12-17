@@ -39,26 +39,28 @@ Sharding:
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import argparse
+import importlib.util
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import importlib.util
 
 import requests
 
-# Pfadberechnung:
-# Wir gehen davon aus, dass dieses Skript unter REPO_ROOT/scripts/ liegt.
-# Dann ist REPO_ROOT = dieses_file.parent.parent
-THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = THIS_FILE.parent.parent
+# ---------------------------------------------------------------------------
+# Pfade / Taxonomie laden (paths_utils per absolutem Pfad laden)
+# ---------------------------------------------------------------------------
+
+# Verzeichnis dieses Skripts: ./dachs_rag_framework/scripts
+THIS_DIR = Path(__file__).resolve().parent
+
+# Repo-Root: ./dachs_rag_framework
+REPO_ROOT = THIS_DIR.parent
 
 # Absoluter Pfad zu config/paths/paths_utils.py
 PATHS_UTILS_PATH = REPO_ROOT / "config" / "paths" / "paths_utils.py"
@@ -93,9 +95,9 @@ def load_json_file(path: Path) -> Any:
 
 def load_taxonomies() -> Dict[str, List[Dict[str, Any]]]:
     """
-    Lädt die Taxonomie-Dateien aus config/taxonomy.
+    Lädt die Taxonomien aus config/taxonomy/*.
 
-    Erwartete Dateien:
+    Erwartet mindestens:
       - content_type.json
       - domain.json
       - artifact_role.json
@@ -118,11 +120,6 @@ def load_taxonomies() -> Dict[str, List[Dict[str, Any]]]:
         taxonomies["chunk_role"] = []
 
     return taxonomies
-
-
-def load_llm_config() -> Dict[str, Any]:
-    """Lädt die LLM-Konfiguration aus config/LLM/semantic_llm.json."""
-    return load_json_file(LLM_CONFIG_PATH)
 
 
 def extract_ids(tax_list: List[Dict[str, Any]]) -> List[str]:
@@ -155,10 +152,6 @@ class LLMSemanticClassifier:
         self.max_tokens = int(config.get("max_tokens", 512))
         # Sicherheits-Limit für Chunk-Textlänge (in Zeichen)
         self.max_chars = int(config.get("max_chars", 4000))
-        # Robustheit: Timeout + Retries für Ollama-Calls
-        self.request_timeout_s = float(config.get("request_timeout_s", 120))
-        self.max_retries = int(config.get("max_retries", 3))
-        self.retry_backoff_s = float(config.get("retry_backoff_s", 5.0))
 
     def classify_chunk(
         self,
@@ -169,17 +162,31 @@ class LLMSemanticClassifier:
         next_text: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Führt einen Klassifikations-/Anreicherungs-Call an das LLM durch
-        und erwartet als Antwort ein JSON-Objekt.
+        Ruft das LLM auf und erwartet ein reines JSON-Objekt als Antwort.
 
-        Gibt im Erfolgsfall ein Dict zurück, sonst None (Fehler-Logging).
+        prev_text / next_text: Nachbar-Chunks als Kontext (optional).
         """
-        # Text ggf. hart begrenzen
+        if not text:
+            return None
+
+        # Haupt-Text ggf. hart beschneiden
         if len(text) > self.max_chars:
             text = text[: self.max_chars]
 
+        # Nachbar-Kontext leicht beschneiden, damit der Prompt nicht explodiert
+        def _clip_neighbor(s: Optional[str], max_len: int = 1000) -> Optional[str]:
+            if not s:
+                return None
+            s = s.strip()
+            if len(s) <= max_len:
+                return s
+            return s[:max_len]
+
+        prev_text = _clip_neighbor(prev_text)
+        next_text = _clip_neighbor(next_text)
+
+        # IDs + optionale Beschreibungen für den Prompt vorbereiten
         def fmt_list(name: str) -> str:
-            """Hilfsfunktion, um Taxonomie-Listen als 'id: desc' auszugeben."""
             items = []
             for entry in taxonomies.get(name, []):
                 _id = entry.get("id")
@@ -347,7 +354,7 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
             ],
             "temperature": self.temperature,
             "stream": False,
-            "format": "json",
+            # kein explizites format=json hier – wir parsen selbst robust
             "options": {
                 "num_predict": self.max_tokens,
             },
@@ -355,29 +362,11 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
 
         url = self.base_url + "/api/chat"
 
-        last_err: Optional[Exception] = None
-        resp = None  # type: ignore[assignment]
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = requests.post(url, json=payload, timeout=self.request_timeout_s)
-                resp.raise_for_status()
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if attempt < self.max_retries:
-                    sleep_s = self.retry_backoff_s * attempt
-                    logging.warning(
-                        "LLM-Request failed (attempt %d/%d): %s – retry in %.1fs",
-                        attempt,
-                        self.max_retries,
-                        e,
-                        sleep_s,
-                    )
-                    time.sleep(sleep_s)
-
-        if last_err is not None:
-            logging.error("LLM-Request failed (final): %s", last_err)
+        try:
+            resp = requests.post(url, json=payload, timeout=120)
+            resp.raise_for_status()
+        except Exception as e:
+            logging.error("LLM-Request failed: %s", e)
             return None
 
         try:
@@ -387,23 +376,23 @@ Now produce the JSON classification and enrichment for the MAIN CHUNK.
             logging.error("Failed to parse LLM JSON response: %s", e)
             return None
 
-        # Der Response-Body sollte bereits ein gültiges JSON-Objekt (dict) sein,
-        # weil wir format=json gesetzt haben. Fallback: falls content nur ein
-        # JSON-String ist, versuchen wir diesen zu parsen.
-        if isinstance(content, dict):
-            return content
+        return self._safe_parse_json(str(content))
 
-        if isinstance(content, str):
-            try:
-                obj = json.loads(content)
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
+    @staticmethod
+    def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
+        """
+        Robustheitsschicht: versucht, aus einem Text ein Dict zu parsen.
+        (inkl. Fällen, wo das Modell fälschlich ```json ... ``` drumherum packt.)
+        """
+        text = text.strip()
+        # Falls Modell blöderweise ```json ... ``` liefert
+        if text.startswith("```"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start : end + 1]
 
-        # Fallback: falls das Modell trotz format=json zusätzlich Text drumherum
-        # schreibt, versuchen wir, die erste JSON-Objekt-Klammerung zu finden.
-        text = str(content)
+        # direct try
         try:
             obj = json.loads(text)
             if isinstance(obj, dict):
@@ -443,10 +432,11 @@ def normalize_semantic_result(
     - begrenzt Listengrößen
     - reicht summary_short, equations, key_quantities strukturiert weiter
     """
-    allowed_content_type = set(extract_ids(taxonomies["content_type"]))
-    allowed_domain = set(extract_ids(taxonomies["domain"]))
-    allowed_artifact_role = set(extract_ids(taxonomies["artifact_role"]))
-    allowed_trust_level = set(extract_ids(taxonomies["trust_level"]))
+    allowed_content_type = set(extract_ids(taxonomies.get("content_type", [])))
+    allowed_domain = set(extract_ids(taxonomies.get("domain", [])))
+    allowed_artifact_role = set(extract_ids(taxonomies.get("artifact_role", [])))
+    allowed_trust_level = set(extract_ids(taxonomies.get("trust_level", [])))
+    allowed_chunk_role = set(extract_ids(taxonomies.get("chunk_role", [])))
 
     # Sprache
     language = raw.get("language", "unknown")
@@ -463,68 +453,55 @@ def normalize_semantic_result(
             s = str(v)
             if s in allowed and s not in out:
                 out.append(s)
-            if max_len is not None and len(out) >= max_len:
-                break
+        if max_len is not None:
+            return out[:max_len]
         return out
 
-    ct = filter_list("content_type", allowed_content_type, max_len=2)
-    dom = filter_list("domain", allowed_domain, max_len=3)
-    ar = filter_list("artifact_role", allowed_artifact_role, max_len=3)
-    cr = filter_list("chunk_role", set(extract_ids(taxonomies.get("chunk_role", []))), max_len=2)
+    content_type = filter_list("content_type", allowed_content_type, max_len=2)
+    domain = filter_list("domain", allowed_domain, max_len=3)
+    artifact_role = filter_list("artifact_role", allowed_artifact_role, max_len=3)
+    chunk_role = filter_list("chunk_role", allowed_chunk_role, max_len=2)
 
-    trust = raw.get("trust_level")
-    if isinstance(trust, str) and trust in allowed_trust_level:
-        trust_str = trust
-    else:
-        trust_str = "medium"
+    # trust_level: genau eins, sonst Fallback
+    tl_raw = str(raw.get("trust_level", "")).strip()
+    trust_level = tl_raw if tl_raw in allowed_trust_level else None
+    if trust_level is None:
+        # Fallback: "medium", falls vorhanden, sonst erster Eintrag
+        if "medium" in allowed_trust_level:
+            trust_level = "medium"
+        else:
+            trust_level = next(iter(allowed_trust_level)) if allowed_trust_level else "unknown"
 
-    summary_short = raw.get("summary_short", "")
-    if not isinstance(summary_short, str):
-        summary_short = ""
+    # summary_short
+    summary_raw = raw.get("summary_short", "")
+    summary_short = ""
+    if isinstance(summary_raw, str):
+        summary_short = summary_raw.strip()
 
-    # equations: Liste von Objekten, wir vertrauen hier weitgehend dem Modell
-    equations_raw = raw.get("equations", [])
+    # equations
+    equations_raw = raw.get("equations")
     equations: List[Dict[str, Any]] = []
     if isinstance(equations_raw, list):
         for eq in equations_raw:
-            if not isinstance(eq, dict):
-                continue
-            latex = eq.get("latex", "")
-            desc = eq.get("description", "")
-            vars_raw = eq.get("variables", [])
-            vars_norm = []
-            if isinstance(vars_raw, list):
-                for v in vars_raw:
-                    if not isinstance(v, dict):
-                        continue
-                    vars_norm.append(
-                        {
-                            "symbol": str(v.get("symbol", "")),
-                            "name": str(v.get("name", "")),
-                            "unit": str(v.get("unit", "")),
-                        }
-                    )
-            equations.append(
-                {
-                    "latex": str(latex),
-                    "description": str(desc),
-                    "variables": vars_norm,
-                }
-            )
+            if isinstance(eq, dict):
+                equations.append(eq)
+            else:
+                equations.append({"description": str(eq)})
 
-    key_quantities_raw = raw.get("key_quantities", [])
+    # key_quantities
+    kq_raw = raw.get("key_quantities", [])
     key_quantities: List[str] = []
-    if isinstance(key_quantities_raw, list):
-        for v in key_quantities_raw:
-            key_quantities.append(str(v))
+    if isinstance(kq_raw, list):
+        for item in kq_raw:
+            key_quantities.append(str(item))
 
     return {
         "language": language,
-        "content_type": ct,
-        "domain": dom,
-        "artifact_role": ar,
-        "trust_level": trust_str,
-        "chunk_role": cr,
+        "content_type": content_type,
+        "domain": domain,
+        "artifact_role": artifact_role,
+        "trust_level": trust_level,
+        "chunk_role": chunk_role,
         "summary_short": summary_short,
         "equations": equations,
         "key_quantities": key_quantities,
@@ -592,8 +569,12 @@ def process_file(
             "job_total": total,
             "job_start_time": time.time(),
         }
-
-    logging.info("Chunks in Datei %s: %d", in_path.name, total)
+    else:
+        # job_total wird bei der ersten Datei einmalig gesetzt
+        if "job_total" not in progress or not progress["job_total"]:
+            progress["job_total"] = total
+        if "job_start_time" not in progress or not progress["job_start_time"]:
+            progress["job_start_time"] = time.time()
 
     # 2) bestehende Ausgabedatei (falls vorhanden) einlesen
     existing_by_chunk: Dict[str, Dict[str, Any]] = {}
@@ -611,14 +592,14 @@ def process_file(
                     rec_old = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                cid = rec_old.get("chunk_id")
-                if not cid:
+                cid_old = rec_old.get("chunk_id")
+                if not cid_old:
                     continue
-                existing_by_chunk[cid] = rec_old
-                sem = rec_old.get("semantic") or {}
-                if isinstance(sem, dict) and sem.get("trust_level"):
+                existing_by_chunk[cid_old] = rec_old
+                sem_old = rec_old.get("semantic") or {}
+                if isinstance(sem_old, dict) and sem_old.get("trust_level"):
                     existing_annotated += 1
-                    existing_annotated_cids.add(cid)
+                    existing_annotated_cids.add(cid_old)
 
         if existing_annotated == total and len(existing_by_chunk) == total:
             logging.info(
@@ -626,8 +607,8 @@ def process_file(
                 total,
                 in_path.name,
             )
-            if progress is not None:
-                progress["job_done"] = progress.get("job_done", 0) + total
+            # Den Fortschrittszähler trotzdem auf "fertig" setzen
+            progress["job_done"] = progress.get("job_done", 0) + total
             return
         else:
             logging.info(
@@ -641,13 +622,14 @@ def process_file(
     annotated_new = 0
     start_time = time.time()
 
-    with out_path.open("w", encoding="utf-8") as fout:
+    # Helper zum Schreiben (ohne die Datei ständig neu zu öffnen)
+    fout = out_path.open("w", encoding="utf-8")
 
-        def _write_record(obj: Dict[str, Any]) -> None:
-            fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            if progress is not None:
-                progress["job_done"] = progress.get("job_done", 0) + 1
+    def _write_record(rec: Dict[str, Any]) -> None:
+        """Einen Record als JSON-Linie in die Ausgabedatei schreiben."""
+        fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    try:
         for idx, rec in enumerate(records):
             cid = rec.get("chunk_id")
 
@@ -662,17 +644,31 @@ def process_file(
                 prev_text = records[idx - 1]["content"] if idx > 0 else None
                 next_text = records[idx + 1]["content"] if idx + 1 < total else None
 
+                semantic_meta: Dict[str, Any] = {
+                    "mode": None,
+                    "used_prev_next": bool(prev_text or next_text),
+                    "used_faiss": False,
+                    "faiss_neighbors": [],
+                }
+                empty_reasons: Dict[str, Optional[str]] = {
+                    "content_type": None,
+                    "domain": None,
+                    "artifact_role": None,
+                    "summary_short": None,
+                }
+
                 # ------------------------------------------------------------
                 # RULE 2: Expand context for heading-only chunks
                 # ------------------------------------------------------------
                 meta = rec.get("meta") or {}
                 is_heading = bool(meta.get("has_heading"))
-                text_clean = content.strip()
 
-                if is_heading and len(text_clean) < 80:
+                if is_heading and len(content.strip()) < 80:
+                    # Wir hängen die nächsten 1–2 Chunks als Kontext an next_text an,
+                    # damit das LLM den Abschnitt besser versteht.
                     context_parts: List[str] = []
 
-                    # nächster Chunk
+                    # direkter Nachfolger
                     if idx + 1 < total:
                         context_parts.append(records[idx + 1].get("content", ""))
 
@@ -725,6 +721,18 @@ def process_file(
                     )
                     if taxonomies.get("chunk_role"):
                         sem_block["chunk_role"] = sem_norm["chunk_role"]
+
+                    semantic_meta["mode"] = "structural_rule1_short"
+                    semantic_meta["used_prev_next"] = False
+                    empty_reasons["content_type"] = "structural_rule1"
+                    empty_reasons["domain"] = "structural_rule1"
+                    empty_reasons["summary_short"] = "structural_rule1"
+
+                    meta_block = sem_block.get("meta") or {}
+                    meta_block.update(semantic_meta)
+                    meta_block["empty_reasons"] = empty_reasons
+                    sem_block["meta"] = meta_block
+
                     rec["semantic"] = sem_block
 
                     _write_record(rec)
@@ -760,6 +768,18 @@ def process_file(
                     )
                     if taxonomies.get("chunk_role"):
                         sem_block["chunk_role"] = sem_norm["chunk_role"]
+
+                    semantic_meta["mode"] = "structural_rule1_numeric"
+                    semantic_meta["used_prev_next"] = False
+                    empty_reasons["content_type"] = "structural_rule1"
+                    empty_reasons["domain"] = "structural_rule1"
+                    empty_reasons["summary_short"] = "structural_rule1"
+
+                    meta_block = sem_block.get("meta") or {}
+                    meta_block.update(semantic_meta)
+                    meta_block["empty_reasons"] = empty_reasons
+                    sem_block["meta"] = meta_block
+
                     rec["semantic"] = sem_block
 
                     _write_record(rec)
@@ -795,6 +815,18 @@ def process_file(
                     )
                     if taxonomies.get("chunk_role"):
                         sem_block["chunk_role"] = sem_norm["chunk_role"]
+
+                    semantic_meta["mode"] = "structural_rule1_label"
+                    semantic_meta["used_prev_next"] = False
+                    empty_reasons["content_type"] = "structural_rule1"
+                    empty_reasons["domain"] = "structural_rule1"
+                    empty_reasons["summary_short"] = "structural_rule1"
+
+                    meta_block = sem_block.get("meta") or {}
+                    meta_block.update(semantic_meta)
+                    meta_block["empty_reasons"] = empty_reasons
+                    sem_block["meta"] = meta_block
+
                     rec["semantic"] = sem_block
 
                     _write_record(rec)
@@ -818,6 +850,16 @@ def process_file(
                 else:
                     semantic = normalize_semantic_result(llm_raw, taxonomies)
 
+                    semantic_meta["mode"] = "llm"
+                    if not semantic.get("content_type"):
+                        empty_reasons["content_type"] = "llm_empty"
+                    if not semantic.get("domain"):
+                        empty_reasons["domain"] = "llm_empty"
+                    if not semantic.get("artifact_role"):
+                        empty_reasons["artifact_role"] = "llm_empty"
+                    if not semantic.get("summary_short"):
+                        empty_reasons["summary_short"] = "llm_empty"
+
                     # DEFAULT artifact_role für strukturelle Chunks (Ticket 3)
                     meta = rec.get("meta") or {}
                     ar_list = list(semantic.get("artifact_role") or [])
@@ -835,6 +877,7 @@ def process_file(
                     if meta.get("has_heading") or meta.get("has_table") or len(text_clean) < 40:
                         if len(semantic.get("summary_short", "")) < 20:
                             semantic["summary_short"] = ""
+                            empty_reasons["summary_short"] = "rule4_suppressed"
 
                     # semantic an den Record hängen
                     existing_sem = rec.get("semantic") or {}
@@ -854,6 +897,11 @@ def process_file(
 
                     if semantic.get("chunk_role"):
                         merged_sem["chunk_role"] = semantic["chunk_role"]
+
+                    meta_block = merged_sem.get("meta") or {}
+                    meta_block.update(semantic_meta)
+                    meta_block["empty_reasons"] = empty_reasons
+                    merged_sem["meta"] = meta_block
 
                     rec["semantic"] = merged_sem
 
@@ -877,16 +925,19 @@ def process_file(
                 eta_str = "unknown"
 
             logging.info(
-                "[job %d/%d] (%.1f%%) elapsed %.1fs, ETA %s (file %s %d/%d)",
+                "[JOB] progress: %d/%d (%.1f%%) elapsed %.1fs, ETA %s",
                 job_done,
                 job_total,
                 frac * 100.0,
                 elapsed,
                 eta_str,
-                in_path.name,
-                idx + 1,
-                total,
             )
+
+            if progress is not None:
+                progress["job_done"] = job_done
+
+    finally:
+        fout.close()
 
     logging.info(
         "Fertig: %s (Chunks gesamt: %d, vorhandene: %d, neu annotiert: %d)",
@@ -895,6 +946,7 @@ def process_file(
         len(existing_by_chunk),
         annotated_new,
     )
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -918,111 +970,109 @@ def main() -> None:
         help="Ausgabeverzeichnis für angereicherte JSONL-Dateien (semantic/json).",
     )
     parser.add_argument(
-        "--log-level",
+        "--config",
         type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log-Level (Standard: INFO).",
+        default=str(LLM_CONFIG_PATH),
+        help="Pfad zu semantic_llm.json (LLM-Konfiguration).",
     )
     parser.add_argument(
-        "--only-file",
-        type=str,
-        default=None,
-        help="Optional: Nur diese eine Datei (Name) verarbeiten (Filter auf input-dir).",
-    )
-    parser.add_argument(
-        "--shard-id",
+        "--limit-files",
         type=int,
         default=None,
-        help="Optional: Shard-ID (0-basiert) für parallele Verarbeitung.",
+        help="Optional: Anzahl Eingabedateien begrenzen (Debug).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Mehr Logging ausgeben.",
     )
     parser.add_argument(
         "--num-shards",
         type=int,
-        default=None,
-        help="Optional: Anzahl Shards für parallele Verarbeitung. "
-        "Files werden deterministisch auf Shards aufgeteilt.",
+        default=1,
+        help="Gesamtzahl der Shards (Array-Jobs).",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Shard-Index dieses Jobs (0-basiert).",
     )
 
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout,
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Taxonomien + LLM-Konfig laden
-    logging.info("Lade Taxonomien aus %s", TAXONOMY_DIR)
-    taxonomies = load_taxonomies()
-
-    logging.info("Lade LLM-Konfiguration aus %s", LLM_CONFIG_PATH)
-    llm_config = load_llm_config()
-
-    classifier = LLMSemanticClassifier(llm_config)
-
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    llm_config_path = Path(args.config).expanduser().resolve()
 
     if not input_dir.is_dir():
-        logging.error("Input-Verzeichnis existiert nicht: %s", input_dir)
-        sys.exit(1)
+        raise SystemExit(f"Eingabeverzeichnis existiert nicht: {input_dir}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not llm_config_path.is_file():
+        raise SystemExit(f"LLM-Konfigurationsdatei fehlt: {llm_config_path}")
 
-    # Alle JSONL-Dateien im input_dir einsammeln
-    files_all = sorted(p for p in input_dir.glob("*.jsonl") if p.is_file())
-
-    if args.only_file:
-        files_all = [p for p in files_all if p.name == args.only_file]
-        if not files_all:
-            logging.error("Keine Datei '%s' im Eingabeverzeichnis gefunden.", args.only_file)
-            sys.exit(1)
-
-    # Sharding (einfaches Round-Robin über die sortierte Liste)
-    if args.shard_id is not None and args.num_shards is not None:
-        shard_id = args.shard_id
-        num_shards = args.num_shards
-        if shard_id < 0 or num_shards <= 0 or shard_id >= num_shards:
-            logging.error("Ungültige Shard-Konfiguration: shard_id=%d, num_shards=%d", shard_id, num_shards)
-            sys.exit(1)
-        files = [f for i, f in enumerate(files_all) if i % num_shards == shard_id]
-        logging.info(
-            "Shard %d/%d: Verarbeite %d Dateien (von gesamt %d).",
-            shard_id,
-            num_shards,
-            len(files),
-            len(files_all),
+    if args.num_shards < 1:
+        raise SystemExit(f"--num-shards muss >= 1 sein, erhalten: {args.num_shards}")
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise SystemExit(
+            f"--shard-id muss im Bereich [0, {args.num_shards - 1}] liegen, erhalten: {args.shard_id}"
         )
-    else:
+
+    llm_config = load_json_file(llm_config_path)
+    taxonomies = load_taxonomies()
+    classifier = LLMSemanticClassifier(llm_config)
+
+    logging.info("Input : %s", input_dir)
+    logging.info("Output: %s", output_dir)
+    logging.info("LLM   : %s @ %s", classifier.model, classifier.base_url)
+
+    # Vollständige Dateiliste
+    files_all = sorted(input_dir.glob("*.jsonl"))
+    if args.limit_files is not None:
+        files_all = files_all[: args.limit_files]
+
+    if not files_all:
+        logging.warning("Keine JSONL-Dateien in %s gefunden.", input_dir)
+        return
+
+    # Sharding anwenden: einfacher Modulo-Split über den Index
+    if args.num_shards == 1:
         files = files_all
-        logging.info("Verarbeite %d Dateien ohne Sharding.", len(files))
+    else:
+        files = [
+            f
+            for idx, f in enumerate(files_all)
+            if idx % args.num_shards == args.shard_id
+        ]
+
+    logging.info(
+        "Sharding-Konfiguration: num_shards=%d, shard_id=%d, files_total=%d, files_in_this_shard=%d",
+        args.num_shards,
+        args.shard_id,
+        len(files_all),
+        len(files),
+    )
 
     if not files:
         logging.warning(
-            "Keine Dateien zu verarbeiten. (input_dir=%s, only_file=%s, shard_id=%s, num_shards=%s)",
-            input_dir,
-            args.only_file,
+            "Shard %d hat keine Dateien zu verarbeiten (num_shards=%d, files_total=%d).",
             args.shard_id,
             args.num_shards,
+            len(files_all),
         )
         return
 
-    # Job-weiter Fortschritt (nur für diesen Shard / diesen SLURM-Task)
-    job_total = 0
-    for p in files:
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                job_total += sum(1 for line in f if line.strip())
-        except Exception:
-            # Fehler wird später in process_file geloggt; hier nur best effort.
-            continue
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if job_total <= 0:
-        # Fallback: zumindest Anzahl Dateien verwenden, damit ETA nicht crasht
-        job_total = len(files)
-
-    progress: Dict[str, Any] = {
+    # globales Fortschrittsobjekt für den ganzen Job
+    job_total = len(files_all)
+    progress = {
         "job_done": 0,
         "job_total": job_total,
         "job_start_time": time.time(),
