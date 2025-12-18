@@ -454,7 +454,7 @@ Die oben gezeigte JSON-Struktur entspricht **genau einem Eintrag in einer `.json
 
 `content_type`, `domain`, `artifact_role`, `trust_level`
 
-Zusätzlich zur Normalform werden semantische Metadaten gepflegt. Diese werden in der semantischen Schicht (`semantic/`) ergänzt und können für jede Chunk-JSON-Datei als weiterer Block eingefügt werden, z. B.:
+Zusätzlich zur Normalform werden semantische Metadaten gepflegt. Diese werden nach der semantischen Anreicherung im Chunk als Block `semantic` abgelegt (unter Beibehaltung von `doc_id` / `chunk_id`). Beispiel:
 
 ```json
 {
@@ -466,32 +466,70 @@ Zusätzlich zur Normalform werden semantische Metadaten gepflegt. Diese werden i
   "language": "en",
   "content": "Here we describe the fundamentals of heat transfer relevant for cooling system design...",
   "meta": {
-    "workspace": "Thermodynamics_Textbooks",
-    "page_start": 45,
-    "page_end": 46,
-    "created_at": "2025-12-01",
-    "tags": ["cooling_system", "heat_transfer"]
+    "has_heading": false,
+    "has_table": false
   },
   "semantic": {
     "content_type": ["textbook"],
-    "domain": ["thermodynamics", "simulation"],
-    "artifact_role": ["procedure"],
-    "trust_level": "high"
+    "domain": ["thermodynamics"],
+    "artifact_role": ["statement"],
+    "trust_level": "high",
+    "chunk_role": ["explanation"],
+    "summary_short": "Short 1–3 sentence summary of this chunk.",
+    "equations": [],
+    "key_quantities": ["heat_transfer_coefficient"],
+    "meta": {
+      "mode": "llm",
+      "used_prev_next": true,
+      "used_faiss": false,
+      "faiss_neighbors": [],
+      "empty_reasons": {
+        "content_type": null,
+        "domain": null,
+        "artifact_role": null,
+        "summary_short": null
+      }
+    }
   }
 }
 ```
 
+**`semantic.meta` (Provenance + Debugbarkeit)**  
+Zusätzlich zu den eigentlichen semantischen Feldern wird ein Provenance-Block gepflegt, um Ergebnisse reproduzierbar, evaluierbar und debuggbar zu machen:
+
+- `semantic.meta.mode`  
+  Kennzeichnet den Pfad, über den der Chunk annotiert wurde, z. B.:
+  - `llm` (normaler LLM-Aufruf)
+  - `structural_rule1_short` / `structural_rule1_numeric` / `structural_rule1_label` (Chunk wurde als strukturell erkannt, kein LLM-Call)
+
+- `semantic.meta.used_prev_next: true|false`  
+  Ob lokaler Nachbar-Kontext (previous/next) im Prompt genutzt wurde.
+
+- `semantic.meta.used_faiss: true|false`  
+  Ob FAISS-Retrieval-Kontext im Prompt genutzt wurde.
+
+- `semantic.meta.faiss_neighbors: [] | [{chunk_id, score, doc_id?}, ...]`  
+  Schlanke Nachbarschaftsliste (ohne Volltext), um später exakte Retrieval-Situationen nachzuvollziehen.
+
+- `semantic.meta.empty_reasons`  
+  Explizite Unterscheidung, warum ein Feld leer ist (Analytics trennt Ursachen):
+  - `llm_empty` → Modell konnte/hat nichts gesetzt (oder nach Taxonomie-Filterung leer)
+  - `structural_rule1` → Feld bewusst leer gesetzt, weil Chunk strukturell/inhaltlos
+  - `rule4_suppressed` → `summary_short` bewusst unterdrückt (Heuristik)
+
 **Kontext- und RAG-Indizes (`semantic/json/ → indices/faiss/`, optional `indices/chroma/`)**  
 - Aufbau eines **globalen Chunk-Kontextindex** über alle Chunks des Workspaces:  
-  - Skript: `scripts/embed_chunks.py`  
+  - Skript: `scripts/build_embeddings.py`  
   - Input: `semantic/json/`  
   - Output:  
     - `indices/faiss/contextual.index` (FAISS-Vektorindex),  
-    - `indices/faiss/contextual_meta.jsonl` (Metadaten je Vektor, inkl. `faiss_id`, `chunk_id`, `doc_id`, `source_path`, `language`, `meta`, `semantic`, …),  
-    - `indices/faiss/contextual_config.json` (Konfiguration: Embedding-Modell, Dimension, Index-Typ, Pfade, Erstellungszeitpunkt, Normalisierungsmodus).  
+    - `indices/faiss/contextual_meta.jsonl` (Metadaten je Vektor: `faiss_id`, `chunk_id`, `doc_id`, `source_path`, `language`, `meta`, `semantic`, …),  
+    - `indices/faiss/contextual_config.json` (Konfiguration: Embedding-Modell, Index-Typ, Pfade, Erstellungszeitpunkt, Normalisierungsmodus).  
 
-- **`faiss_id`** entspricht der Position des Vektors im FAISS-Index (`IndexFlat*`) und dient als Schlüssel, um Suchergebnisse (`faiss_id`) wieder auf `chunk_id`/`doc_id` zu mappen.  
-- Die Config-Datei wird von `embed_chunks.py` automatisch erzeugt und kann von anderen Komponenten (z. B. KNIME, QA-Generator, Analyse-Skripte) genutzt werden, um Modell/Index-Parameter ohne harten Code zu lesen.
+- **`faiss_id`** entspricht der Position des Vektors im FAISS-Index und wird verwendet, um Trefferergebnisse (`faiss_id`) wieder auf `chunk_id`/`doc_id` zu mappen.  
+- Die Config-Datei wird automatisch erzeugt und kann in späteren Schritten genutzt werden, um Modell/Index-Parameter ohne harten Code zu lesen.
+
+---
 
 ### 4.2.0 Taxonomie-Konfiguration (config/taxonomy)
 
@@ -991,11 +1029,21 @@ Für jeden Chunk werden u. a. folgende Felder befüllt/ergänzt:
 - `semantic.equations` – Liste erkannter Gleichungen inkl. Variablen, Beschreibung, Einheiten.
 - `semantic.key_quantities` – Liste der wichtigsten physikalischen / technischen Größen, die im Chunk vorkommen.
 
-Nicht alle Felder sind für jeden Chunk sinnvoll befüllbar. Insbesondere für rein strukturelle Chunks (Kapitelnummern, Tabellen-/Abbildungs-Labels, Layoutfragmente) werden `summary_short`, `content_type` und `domain` im Zweifel bewusst leer gelassen und nur einfache Rollen wie `artifact_role = ["structural"]` bzw. `["heading"]`, `["table"]` vergeben.
+Nicht alle Felder sind für jeden Chunk sinnvoll befüllbar. Insbesondere bei strukturellen Fragmenten werden `content_type`/`domain` im Zweifel bewusst leer gelassen und nur einfache Rollen wie `artifact_role = ["structural"]` bzw. `["heading"]`, `["table"]` vergeben.
+
+**Neu: Provenance & „Empty“-Ursachen für Debug/Evaluation**  
+Zusätzlich wird ein Provenance-Block gepflegt:
+
+- `semantic.meta.mode` (z. B. `llm` oder `structural_rule1_*`)
+- `semantic.meta.used_prev_next` (ob lokaler Nachbar-Kontext genutzt wurde)
+- `semantic.meta.used_faiss` + `semantic.meta.faiss_neighbors` (Retrieval-Nutzung und Nachbarschaftsliste)
+- `semantic.meta.empty_reasons` (warum Felder leer sind: `llm_empty` vs. `structural_rule1` vs. `rule4_suppressed`)
+
+Damit kann später klar ausgewertet werden, ob „empty“-Werte fachlich bedingt sind (LLM konnte nichts bestimmen) oder bewusst durch Heuristiken/Regeln erzeugt wurden.
 
 #### 6.2.2 LLM-Aufruf mit optionalem Retrieval-Kontext
 
-Statt jeden Chunk isoliert zu betrachten, kann (und sollte) die semantische Anreicherung **Retrieval-Kontext** aus dem globalen FAISS-Kontextindex nutzen.
+Statt jeden Chunk isoliert zu betrachten, kann die semantische Anreicherung optional Retrieval-Kontext aus dem globalen FAISS-Kontextindex nutzen.
 
 Technischer Weg:
 
@@ -1008,56 +1056,37 @@ Technischer Weg:
 Ablauf bei aktiviertem Retrieval (z. B. `use_retrieval_for_semantics = true` in `config/pipeline/semantic_config.json`):
 
 1. **Ziel-Chunk bestimmen**  
-   - `annotate_semantics.py` iteriert über alle Chunks in `normalized/json/` (bzw. über bereits existierende Einträge in `semantic/json/` bei Wiederaufnahme).
+   - `annotate_semantics.py` iteriert über alle Chunks in `normalized/json/` (inkl. Wiederaufnahme über bereits existierende Einträge in `semantic/json/`).
 
 2. **Nachbarn über FAISS holen**  
-   - Für `chunk_id` von `C` ruft das Skript den Retriever auf, z. B.:
-     - `neighbors = retriever.get_neighbors_for_chunk(chunk_id=C.chunk_id, top_k=K, include_self=False)`
-   - Der Retriever liefert eine Liste von Treffern mit:
-     - `faiss_id`, `score` (Ähnlichkeit/Distanz, je nach Index),
-     - `chunk_id`, `doc_id`, `source_path`, `semantic`, `meta`, `trust_level`, `content_type`, `domain`, …
+   - Für `chunk_id` von `C` ruft das Skript den Retriever auf (Top-K).
+   - Der Retriever liefert eine Liste von Treffern inkl. `score` und Metadaten.
 
-3. **Nachbarn filtern / kürzen**  
+3. **Nachbarn filtern / kürzen (optional)**  
    - Optional werden Nachbarn verworfen, wenn:
-     - der `score` unter einen Schwellwert fällt (`similarity_threshold`),
-     - `trust_level` nicht zu gewünschten Werten gehört (z. B. nur „high“),
-     - `content_type` und `domain` nicht zum Ziel-Chunk passen.
-   - Zusätzlich können *lokale Nachbarn* im gleichen Dokument hinzugezogen werden (z. B. vorheriger/nächster Chunk oder gleiche `page_range`).
+     - der Score unter einen Schwellwert fällt (`similarity_threshold`),
+     - `trust_level` nicht zu gewünschten Werten gehört,
+     - `content_type`/`domain` nicht konsistent sind.
+   - Zusätzlich werden Nachbartexte für den Prompt begrenzt (z. B. `max_context_chars_per_neighbor`).
 
-4. **Prompt-Kontext zusammenbauen**  
-   - Aus jedem Nachbar-Chunk wird ein kurzer Ausschnitt (z. B. ein oder zwei Sätze, begrenzt durch `max_context_chars_per_neighbor`) in Klartext extrahiert.
-   - Der LLM-Prompt erhält:
-     1. den **Ziel-Chunk** (voller Text),
-     2. eine **Liste von Kurzkontexten** aus Nachbar-Chunks (mit knapper Quellenangabe, z. B. `doc_id`, `chunk_id`),
-     3. klare Anweisungen, wie `semantic.*`-Felder (Rollen, Labels, `summary_short`, …) zu setzen sind.
+4. **Prompt erweitern**  
+   - Die Nachbartexte werden als zusätzlicher Kontext in den User-Prompt eingefügt (ohne diese Nachbarn separat zu klassifizieren).
 
-Zusätzlich zur reinen Übergabe von Ziel-Chunk und optionalem FAISS-Kontext gelten folgende Heuristiken im LLM-Aufruf:
+**Provenance bei Retrieval (C)**  
+Bei aktivem Retrieval wird die verwendete Nachbarschaft im Output gespeichert:
+- `semantic.meta.used_faiss = true`
+- `semantic.meta.faiss_neighbors = [{chunk_id, score, doc_id?}, ...]`
 
-- **Lokaler Heading-Kontext**:  
-  Kurze Überschriften-Chunks (`meta.has_heading = true` und `len(content) < 80`) werden nie isoliert betrachtet. Der LLM-Prompt erhält zusätzlich den Inhalt der folgenden 1–2 Chunks als „NEIGHBORING CONTEXT“. So können `domain`, `content_type` und `artifact_role` auch für reine Abschnittsüberschriften sinnvoll gesetzt werden.
+Wenn Retrieval deaktiviert ist, bleibt:
+- `semantic.meta.used_faiss = false`
+- `semantic.meta.faiss_neighbors = []`
 
-- **Regel für nicht-informative Chunks im Prompt**:  
-  Der System-Prompt enthält eine explizite Anweisung: Wenn der MAIN CHUNK praktisch keine Information trägt (weniger als 5 Zeichen oder nur Zahlen/Punkt/Interpunktion), soll das Modell
-  - `language = "unknown"`,
-  - leere Listen für `content_type`, `domain`, `artifact_role`, `chunk_role`, `key_quantities`,
-  - `trust_level = "low"` (oder ein anderer gültiger ID-Wert),
-  - `summary_short = ""` und `equations = []`
-  zurückgeben und **keine künstliche Semantik halluzinieren**.
+**Heuristiken & „Empty“-Markierung (C)**  
+Vor und nach dem LLM-Aufruf werden heuristische Regeln angewandt (z. B. Skip rein struktureller Chunks; Unterdrückung zu kurzer Summaries). Diese Regeln werden transparent gemacht über:
+- `semantic.meta.mode = structural_rule1_*` (kein LLM-Call)
+- `semantic.meta.empty_reasons.summary_short = rule4_suppressed` (Summary bewusst unterdrückt)
+- `semantic.meta.empty_reasons.* = llm_empty` (LLM konnte Feld nicht befüllen oder Ergebnis wurde durch Taxonomie-Filterung leer)
 
-In Kombination mit den Skript-Heuristiken (siehe 6.2.4) sorgt das dafür, dass das LLM nur dort „verstehende“ Anreicherungen erzeugt, wo tatsächlich Inhalt vorhanden ist, und Layout-/Strukturfragmente konsistent als solche markiert werden.
-
-
-Typische Konfigurationsparameter (z. B. in `semantic_config.json`):
-
-- `use_retrieval_for_semantics: true|false`  
-- `neighbors_k: int` (z. B. 3–5)  
-- `similarity_threshold: float` (optional, um sehr schwache Nachbarn zu verwerfen)  
-- `max_context_chars_per_neighbor: int` (z. B. 500)  
-- optionale Filterlisten für `trust_level`, `content_type`, `domain`  
-
-Wenn `use_retrieval_for_semantics = false` gesetzt ist, arbeitet `annotate_semantics.py` nur mit dem Ziel-Chunk und ggf. einfachen lokalen Nachbarn (keine FAISS-Abfrage).
-
----
 
 ## 6.2.3 Ein- und Ausgabeformate
 
