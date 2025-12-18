@@ -1287,7 +1287,7 @@ Das Skript nutzt standardmäßig das Ollama-Chat-API (`/api/chat`) über HTTP.
 - Für Stabilität werden `max_retries` und `retry_backoff_s` unterstützt (Retry + Exponential Backoff).
 - Bei Parse-/HTTP-Fehlern wird das jeweilige Sample übersprungen (Logging).
 
-### 6.3.6 Konfiguration und CLI von `generate_qa_candidates.py`
+## 6.3.6 Konfiguration und CLI von `generate_qa_candidates.py` (Pfad-SSOT)
 
 Gesteuert über:
 
@@ -1295,72 +1295,186 @@ Gesteuert über:
 config/qa/qa_generation.default.json
 ```
 
-Relevante (typische) Schlüssel:
+**Wichtig (neu): Pfade sind nicht mehr in der QA-Config zu duplizieren.**  
+Alle Workspace- und Verzeichnis-Pfade kommen aus:
+
+```text
+config/paths/paths.json
+```
+
+Die QA-Config referenziert dafür nur noch `paths.paths_file` und enthält ansonsten ausschließlich *Regler* (Filter, Neighbors, Grouping, Sampling, LLM, Runtime, Output).
+
+### Pfadauflösung (aus `paths.json`)
+
+Erwartete Keys in `paths.json`:
+
+- `workspace_root`
+- `paths.semantic_json`  → Input für Kandidaten
+- `paths.qa_candidates`  → Output der Kandidaten
+- `paths.faiss_index` / `paths.faiss_meta` → Kontextindex + Metadaten
+
+Damit ist `config/paths/paths.json` die **Single Source of Truth**, und QA-Config-Drift wird verhindert.
+
+### Relevante Schlüssel (QA-Config)
 
 - `paths`:
-  - `workspace_root`, `semantic_dir`, `qa_candidates_dir`,
+  - `paths_file` (Pfad zu `config/paths/paths.json`)
   - `prompt_system_file`, `prompt_user_template_file`
 - `filters`:
-  - `languages_allowed`, `trust_levels_allowed`, `content_types_allowed`,
-  - optional: `artifact_roles_excluded`, `min_content_chars`
+  - `languages_allowed`, `trust_levels_allowed`, `content_types_allowed`
+  - `chunk_roles_allowed` (z. B. `definition`, `explanation`, `example`, …)
 - `neighbors`:
-  - `top_k_faiss`, `max_neighbors`,
-  - `similarity_threshold` (Achtung: Interpretation hängt von Indexmetrik ab),
+  - `top_k_faiss`, `max_neighbors`
+  - `similarity_threshold` (Interpretation hängt von Indexmetrik ab)
   - `max_local_neighbors_before`, `max_local_neighbors_after`
 - `grouping`:
-  - `min_group_size`, `max_group_size`,
-  - optional: `max_chars_per_chunk`, `max_total_context_chars`
+  - `min_group_size`, `max_group_size`, `max_tokens_context`
 - `sampling`:
-  - `max_qa_per_group`, `max_groups_per_chunk`,
-  - `max_qa_per_document`, `global_qa_limit`
+  - `max_qa_per_group`, `max_groups_per_chunk`, `max_qa_per_document`, `global_qa_limit`
 - `llm`:
-  - `backend`, `model`, `temperature`, `top_p`, `max_tokens`,
-  - `request_timeout_s`, optional: `max_retries`, `retry_backoff_s`
+  - `backend`, `model`, `temperature`, `top_p`, `max_tokens`
+  - `request_timeout_s`, `max_retries`, `retry_backoff_s`
 - `runtime`:
-  - `resume_mode` (`append|resume|overwrite`), `log_level`,
-  - `dry_run`, `log_every_n_examples`
-- `debug`:
-  - `limit_num_files`, `limit_num_chunks`
+  - `num_workers`, `shuffle_files`, `resume_mode`, `dry_run`, `log_level`
+- `output`:
+  - `qa_schema_version`, `include_source_text`, `include_semantic_tags`
+  - `output_file_pattern`
 
-**Beispiele:**
+### CLI (Beispiele)
 
-```bash
-cd ~/dachs_rag_framework
-python scripts/generate_qa_candidates.py
-```
-
-Expliziter Workspace + reduzierte Dateianzahl, explizite Config:
+Minimal:
 
 ```bash
-python scripts/generate_qa_candidates.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --config config/qa/qa_generation.default.json   --limit-num-files 3   --log-level DEBUG
+python scripts/generate_qa_candidates.py \
+  --config config/qa/qa_generation.default.json
 ```
 
-## 6.4 Schritt 4: Qualitätssicherung der Q/A-Sätze
+Debug (nur wenige Input-Dateien):
 
-Ziele:
+```bash
+python scripts/generate_qa_candidates.py \
+  --config config/qa/qa_generation.default.json \
+  --limit-num-files 3 \
+  --log-level DEBUG
+```
 
-- Entfernen offensichtlich ungeeigneter Beispiele.
-- Sicherstellen, dass Formate und Pflichtfelder korrekt sind.
-- Vorbereitung eines sauberen Trainingsdatensatzes.
+## 6.4 Schritt 6: Qualitätssicherung und Dataset-Build (`qa_candidates/jsonl/ → qa_final/jsonl/`)
 
-Skript:
+**Ziel:** Aus LLM-generierten Kandidaten einen **sauberen, deduplizierten, versionierten Trainingsdatensatz** bauen.
 
-- `qa_filter_and_merge.py`
+Skript (neu, ersetzt den bisherigen Platzhalter `qa_filter_and_merge.py`):
 
-Funktionen:
+- `scripts/generate_qa_dataset.py`
 
-- Syntax-Check der JSONL-Dateien (vollständige Felder, keine kaputten Zeilen).
-- automatische Filter:
-  - zu kurze oder zu lange `output`s,
-  - Widersprüche in `language` vs. tatsächlichem Text (einfacher Heuristik-Check),
-  - Duplikate (identische oder sehr ähnliche `instruction`/`output`).
-- optional:
-  - einfache Plausibilitätschecks (z. B. Einheiten, Zahlenbereiche), soweit automatisierbar.
+Konfiguration (neu):
 
-Ergebnis:
+```text
+config/qa/qa_dataset.default.json
+```
 
-- ein konsolidierter Datensatz, z. B. `qa_final_v1.jsonl` im Ordner `qa_final/jsonl/`.
+Pfad-SSOT (wie oben):
 
+```text
+config/paths/paths.json
+```
+
+### 6.4.1 Input / Output
+
+- **Input:** JSONL-Dateien in `paths.qa_candidates` (aus `paths.json`)
+  - pro Zeile ein Kandidat (`dict`)
+  - Pflichtfelder: `question`, `answer`
+  - optional: `language`, `trust_level`, `content_type`, `domain`, `source_chunks`, `anchor_chunk_id`, `provenance`, …
+- **Output:** versioniertes JSONL in `paths.qa_final`
+  - z. B. `qa_final_v1.jsonl`, `qa_final_v2.jsonl`, …
+  - optional zusätzlich:
+    - `qa_rejects_vN.jsonl` (Drop-Gründe)
+    - `CHANGELOG.md` (Version-Historie)
+
+### 6.4.2 Kernfunktionen
+
+1. **Robuster JSONL-Load**
+   - kaputte Zeilen werden geloggt und übersprungen (kein harter Abbruch).
+
+2. **Heuristische Filter (konfigurierbar)**
+   - Pflichtfelder (`question`, `answer`)
+   - Längenfilter (min/max chars für Frage/Antwort)
+   - Quellenpflicht: `source_chunks` muss existieren und nicht leer sein (optional)
+   - Label-Filter (falls im Kandidat vorhanden):
+     - `languages_allowed`
+     - `trust_levels_allowed`
+     - `content_types_allowed`
+   - optional: sehr einfache Sprach-Heuristik gegen Label (`drop_if_language_mismatch`)
+
+3. **Dedup (exact)**
+   - entfernt Duplikate über `dedup.keys` (typisch: `instruction`+`output`).
+
+4. **Mapping ins Trainingsschema (Instruction-Tuning)**
+   - `instruction` ← `question`
+   - `input` ← konstanter Wert (default: `""`)
+   - `output` ← `answer`
+   - zusätzlich Metadaten + Provenance (Auditability)
+
+5. **Versionierung + Changelog**
+   - `version=auto` ⇒ nimmt das höchste vorhandene `qa_final_vN.jsonl` und erzeugt `v(N+1)`
+   - schreibt pro Release einen Eintrag in `CHANGELOG.md` (kept/read/dropped/dupes + Filtersettings)
+
+### 6.4.3 Output-Schema (pro Zeile)
+
+Jedes Sample ist ein JSON-Objekt mit Kernfeldern:
+
+- `id` (konfigurierbare Strategie)
+- `instruction`, `input`, `output`
+- `language`, `content_type` (Liste), `domain` (Liste), `trust_level`
+- `source_ids` (z. B. `chunk:<chunk_id>`)
+- `created_by`, `created_at`, `version`
+- `provenance`, `candidate_id`, `anchor_chunk_id`, `anchor_doc_id`, `difficulty`, …
+
+### 6.4.4 ID-Strategie und Resume
+
+**ID-Strategie** (Config: `id.strategy`):
+
+- `sequential` (Default): `ws_00001_q1` (Zero-Pad konfigurierbar)
+- `candidate`: übernimmt `candidate_id` wenn vorhanden
+- `hash`: SHA1-basierter Kurzhash aus (anchor + instruction + output)
+
+**Resume / Overwrite** (Config: `runtime.resume_mode`):
+
+- `overwrite` (Default): Output neu schreiben
+- `append`: an bestehende Datei anhängen
+- `resume`: existierende IDs aus Output laden und überspringen
+
+### 6.4.5 CLI (Beispiele)
+
+Minimal:
+
+```bash
+python scripts/generate_qa_dataset.py \
+  --config config/qa/qa_dataset.default.json
+```
+
+Explizite Version + Dry-Run:
+
+```bash
+python scripts/generate_qa_dataset.py \
+  --config config/qa/qa_dataset.default.json \
+  --version v3 \
+  --dry-run
+```
+
+Debug (limit):
+
+```bash
+python scripts/generate_qa_dataset.py \
+  --config config/qa/qa_dataset.default.json \
+  --limit-num-files 2 \
+  --limit-num-examples 200
+```
+
+### 6.4.6 Abgrenzung (bewusst)
+
+- Kein LLM-Scoring/„Reranking“ in diesem Schritt.
+- Kein FAISS-basiertes Groundedness-Checking (nur Quellen-Presence + optionale Heuristik).
+- Dedup aktuell „exact“ (kein fuzzy/semantic dedup).
 
 ## 6.5 Aufbau von Vektorindizes (aufgeteilt in Kontext- und RAG-Indizes)
 
