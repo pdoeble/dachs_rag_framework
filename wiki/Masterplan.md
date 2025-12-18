@@ -1287,7 +1287,7 @@ Das Skript nutzt standardmäßig das Ollama-Chat-API (`/api/chat`) über HTTP.
 - Für Stabilität werden `max_retries` und `retry_backoff_s` unterstützt (Retry + Exponential Backoff).
 - Bei Parse-/HTTP-Fehlern wird das jeweilige Sample übersprungen (Logging).
 
-## 6.3.6 Konfiguration und CLI von `generate_qa_candidates.py` (Pfad-SSOT)
+### 6.3.6 Konfiguration und CLI von `generate_qa_candidates.py`
 
 Gesteuert über:
 
@@ -1295,68 +1295,88 @@ Gesteuert über:
 config/qa/qa_generation.default.json
 ```
 
-**Wichtig (neu): Pfade sind nicht mehr in der QA-Config zu duplizieren.**  
-Alle Workspace- und Verzeichnis-Pfade kommen aus:
-
-```text
-config/paths/paths.json
-```
-
-Die QA-Config referenziert dafür nur noch `paths.paths_file` und enthält ansonsten ausschließlich *Regler* (Filter, Neighbors, Grouping, Sampling, LLM, Runtime, Output).
-
-### Pfadauflösung (aus `paths.json`)
-
-Erwartete Keys in `paths.json`:
-
-- `workspace_root`
-- `paths.semantic_json`  → Input für Kandidaten
-- `paths.qa_candidates`  → Output der Kandidaten
-- `paths.faiss_index` / `paths.faiss_meta` → Kontextindex + Metadaten
-
-Damit ist `config/paths/paths.json` die **Single Source of Truth**, und QA-Config-Drift wird verhindert.
-
-### Relevante Schlüssel (QA-Config)
+Relevante (typische) Schlüssel:
 
 - `paths`:
-  - `paths_file` (Pfad zu `config/paths/paths.json`)
+  - `workspace_root`, `semantic_dir`, `qa_candidates_dir`,
   - `prompt_system_file`, `prompt_user_template_file`
 - `filters`:
-  - `languages_allowed`, `trust_levels_allowed`, `content_types_allowed`
-  - `chunk_roles_allowed` (z. B. `definition`, `explanation`, `example`, …)
+  - `languages_allowed`, `trust_levels_allowed`, `content_types_allowed`,
+  - optional: `artifact_roles_excluded`, `min_content_chars`
 - `neighbors`:
-  - `top_k_faiss`, `max_neighbors`
-  - `similarity_threshold` (Interpretation hängt von Indexmetrik ab)
+  - `top_k_faiss`, `max_neighbors`,
+  - `similarity_threshold` (Achtung: Interpretation hängt von Indexmetrik ab),
   - `max_local_neighbors_before`, `max_local_neighbors_after`
 - `grouping`:
-  - `min_group_size`, `max_group_size`, `max_tokens_context`
+  - `min_group_size`, `max_group_size`,
+  - optional: `max_chars_per_chunk`, `max_total_context_chars`
 - `sampling`:
-  - `max_qa_per_group`, `max_groups_per_chunk`, `max_qa_per_document`, `global_qa_limit`
+  - `max_qa_per_group`, `max_groups_per_chunk`,
+  - `max_qa_per_document`, `global_qa_limit`
 - `llm`:
-  - `backend`, `model`, `temperature`, `top_p`, `max_tokens`
-  - `request_timeout_s`, `max_retries`, `retry_backoff_s`
+  - `backend`, `model`, `temperature`, `top_p`, `max_tokens`,
+  - `request_timeout_s`, optional: `max_retries`, `retry_backoff_s`
 - `runtime`:
-  - `num_workers`, `shuffle_files`, `resume_mode`, `dry_run`, `log_level`
-- `output`:
-  - `qa_schema_version`, `include_source_text`, `include_semantic_tags`
-  - `output_file_pattern`
+  - `resume_mode` (`append|resume|overwrite`), `log_level`,
+  - `dry_run`, `log_every_n_examples`
+- `debug`:
+  - `limit_num_files`, `limit_num_chunks`
 
-### CLI (Beispiele)
-
-Minimal:
+**Beispiele:**
 
 ```bash
-python scripts/generate_qa_candidates.py \
-  --config config/qa/qa_generation.default.json
+cd ~/dachs_rag_framework
+python scripts/generate_qa_candidates.py
 ```
 
-Debug (nur wenige Input-Dateien):
+Expliziter Workspace + reduzierte Dateianzahl, explizite Config:
 
 ```bash
-python scripts/generate_qa_candidates.py \
-  --config config/qa/qa_generation.default.json \
-  --limit-num-files 3 \
-  --log-level DEBUG
+python scripts/generate_qa_candidates.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --config config/qa/qa_generation.default.json   --limit-num-files 3   --log-level DEBUG
 ```
+### 6.3.7 HPC/SLURM: Sharding-Run als GPU-Array (wichtig: Ollama-Port pro Task)
+
+Für lineare Skalierung auf mehrere GPUs wird `generate_qa_candidates.py` als SLURM-Array gestartet und per
+
+- `--num-shards N`
+- `--shard-id i` (0-basiert, typischerweise `SLURM_ARRAY_TASK_ID`)
+
+aufgeteilt. Jeder Task verarbeitet einen disjunkten Teil der `semantic/json`-Dateien.
+
+**Kritischer Fallstrick (Multi-GPU Nodes):**  
+Wenn in jedem Array-Task `ollama serve` auf dem Default-Port `127.0.0.1:11434` gestartet wird, kollidieren parallele Tasks auf demselben Node (Port bereits belegt). Deshalb muss **pro Task** ein eigener Port verwendet werden.
+
+**Empfohlenes Muster:**
+
+- Port pro Task: `OLLAMA_PORT = 11434 + SLURM_ARRAY_TASK_ID`
+- `trap`/Cleanup, damit der Server auch bei Fehlern beendet wird
+- kurzer Readiness-Loop, bevor Python startet
+
+Beispiel (Auszug):
+
+```bash
+#SBATCH --array=0-19%5
+
+OLLAMA_PORT=$((11434 + SLURM_ARRAY_TASK_ID))
+export OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT}"
+export OLLAMA_API_URL="http://127.0.0.1:${OLLAMA_PORT}/api/chat"
+
+ollama serve >/tmp/ollama_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log 2>&1 &
+OLLAMA_PID=$!
+trap 'kill "${OLLAMA_PID}" >/dev/null 2>&1 || true' EXIT
+
+# optional: warten bis /api/tags erreichbar ist
+for _ in $(seq 1 30); do
+  curl -fsS "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 && break
+  sleep 1
+done
+
+python scripts/generate_qa_candidates.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --num-shards 20   --shard-id "${SLURM_ARRAY_TASK_ID}"
+```
+
+**Hinweis zu `global_qa_limit`:**  
+Ein wirklich globales Limit über alle Shards ist ohne Koordination nicht exakt durchsetzbar. In der Sharding-Variante wird ein gesetztes `global_qa_limit` deshalb auf die Shards aufgeteilt (≈ `ceil(limit / num_shards)`), um insgesamt im Zielbereich zu bleiben.
+
 
 ## 6.4 Schritt 6: Qualitätssicherung und Dataset-Build (`qa_candidates/jsonl/ → qa_final/jsonl/`)
 

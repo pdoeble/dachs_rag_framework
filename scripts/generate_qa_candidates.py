@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -54,11 +55,6 @@ except Exception as e:  # pragma: no cover
         "Konnte 'FaissRetriever' aus 'scripts/faiss_retriever' nicht importieren. "
         "Bitte sicherstellen, dass das Skript im selben Repository liegt."
     ) from e
-
-
-# ---------------------------------------------------------------------------
-# Dataklassen / Typen
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -112,11 +108,6 @@ class FaissMetricInfo:
     @property
     def higher_is_better(self) -> bool:
         return self.metric.upper() == "IP"
-
-
-# ---------------------------------------------------------------------------
-# Hilfsfunktionen für Dateien & JSON
-# ---------------------------------------------------------------------------
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -220,11 +211,6 @@ def load_faiss_metric_info(workspace_root: Path) -> FaissMetricInfo:
     return FaissMetricInfo(metric=metric, index_type=index_type, normalized=normalized)
 
 
-# ---------------------------------------------------------------------------
-# Semantik-Helfer
-# ---------------------------------------------------------------------------
-
-
 def get_semantic_field(chunk: Dict[str, Any], field: str, default: Any = None) -> Any:
     if field in chunk:
         return chunk[field]
@@ -279,11 +265,6 @@ def is_candidate_chunk(chunk: Dict[str, Any], cfg: QAConfig) -> bool:
         return False
 
     return True
-
-
-# ---------------------------------------------------------------------------
-# Kontextbildung mit FAISS + lokalen Nachbarn
-# ---------------------------------------------------------------------------
 
 
 def get_local_neighbors(
@@ -433,11 +414,6 @@ def build_context_group(
         ordered_chunks = ordered_chunks[:max_group_size]
 
     return ordered_chunks
-
-
-# ---------------------------------------------------------------------------
-# LLM-Aufruf (Ollama-Backend)
-# ---------------------------------------------------------------------------
 
 
 def extract_json_from_text(text: str) -> Any:
@@ -621,7 +597,6 @@ def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
             "- Do NOT mention chunk_id, doc_id, source paths, or any metadata.\n"
         )
 
-
     if user_template is None:
         user_template = (
             "You are given context chunks from technical documents. Each chunk is labeled for you only.\n"
@@ -657,11 +632,6 @@ def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
         )
 
     return system_prompt, user_template
-
-
-# ---------------------------------------------------------------------------
-# Hauptlogik pro Datei
-# ---------------------------------------------------------------------------
 
 
 def process_semantic_file(
@@ -775,9 +745,7 @@ def process_semantic_file(
         faiss_neighbor_ids = [
             str(nb.get("chunk_id")) for nb in faiss_neighbors_filtered if nb.get("chunk_id")
         ]
-        faiss_neighbor_scores = [
-            float(nb.get("score") or 0.0) for nb in faiss_neighbors_filtered
-        ]
+        faiss_neighbor_scores = [float(nb.get("score") or 0.0) for nb in faiss_neighbors_filtered]
 
         context_group = build_context_group(
             candidate=chunk,
@@ -946,11 +914,6 @@ def process_semantic_file(
     return total_written
 
 
-# ---------------------------------------------------------------------------
-# CLI & Main
-# ---------------------------------------------------------------------------
-
-
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generiert Q/A-Kandidaten aus semantic/json mithilfe eines LLM und eines FAISS-Kontextindex.",
@@ -978,6 +941,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Optionales Limit der Anzahl zu verarbeitender Dateien.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Gesamtzahl der Shards (Array-Jobs).",
+    )
+    parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Shard-Index dieses Jobs (0-basiert).",
     )
     return parser.parse_args(argv)
 
@@ -1056,11 +1031,44 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     semantic_files = list(iter_semantic_files(semantic_dir, limit_num_files))
+
+    # Sharding anwenden: einfacher Modulo-Split über den Index (analog zu annotate_semantics.py)
+    if args.num_shards < 1:
+        raise SystemExit("--num-shards muss >= 1 sein")
+    if args.shard_id < 0 or args.shard_id >= args.num_shards:
+        raise SystemExit("--shard-id muss in [0, num-shards) liegen")
+
+    if args.num_shards == 1:
+        semantic_files_sharded = semantic_files
+    else:
+        semantic_files_sharded = [
+            f for idx, f in enumerate(semantic_files) if idx % args.num_shards == args.shard_id
+        ]
+
+    semantic_files = semantic_files_sharded
+
+    logging.info(
+        "Sharding: shard_id=%d / num_shards=%d -> %d semantic-Dateien",
+        args.shard_id,
+        args.num_shards,
+        len(semantic_files),
+    )
+
     if not semantic_files:
         logging.warning("Keine semantic/json-Dateien in %s gefunden.", semantic_dir)
         return
 
     global_qa_limit = int(cfg.sampling.get("global_qa_limit", 0))
+
+    # Hinweis: Wenn wir per Sharding auf mehrere Jobs skalieren, ist ein "globales" Limit über alle Shards
+    # ohne Koordination nicht sauber durchsetzbar. Daher teilen wir ein gesetztes global_qa_limit auf die Shards auf.
+    if global_qa_limit > 0 and args.num_shards > 1:
+        global_qa_limit = int(math.ceil(global_qa_limit / float(args.num_shards)))
+        logging.info(
+            "global_qa_limit wird auf Shards aufgeteilt -> pro Shard: %d",
+            global_qa_limit,
+        )
+
     global_state: Dict[str, Any] = {
         "remaining_global": global_qa_limit if global_qa_limit > 0 else None
     }
