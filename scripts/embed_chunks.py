@@ -165,20 +165,12 @@ def build_text_from_chunk(chunk: Dict[str, Any]) -> str:
         return f"{title}\n\n{content}"
     return content
 
-
 def collect_chunks(
     normalized_root: str,
     logger: logging.Logger,
     max_chunks: int | None = None,
+    exclude_unknown: bool = False,
 ) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
-    """
-    Lädt alle Chunks aus semantic/json (inkl. .jsonl) und sammelt:
-    - Texte (für Embeddings)
-    - Metadaten pro Chunk
-    - Chunk-IDs
-
-    max_chunks: wenn gesetzt, begrenzt die Anzahl der geladenen Chunks.
-    """
     texts: List[str] = []
     metas: List[Dict[str, Any]] = []
     chunk_ids: List[str] = []
@@ -193,7 +185,6 @@ def collect_chunks(
         lower = fpath.lower()
 
         if lower.endswith(".json"):
-            # ganze Datei als JSON laden
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     doc = json.load(f)
@@ -211,21 +202,35 @@ def collect_chunks(
                     )
                     continue
 
+                semantic = chunk.get("semantic", {}) or {}
+
+                artifact_role = semantic.get("artifact_role") or []
+                if isinstance(artifact_role, str):
+                    artifact_role = [artifact_role]
+                if "structural" in artifact_role:
+                    continue
+
+                lang = semantic.get("language") or chunk.get("language")
+                if exclude_unknown and lang == "unknown":
+                    continue
+
                 text = build_text_from_chunk(chunk)
                 if not text.strip():
                     continue
 
-                semantic = chunk.get("semantic", {}) or {}
+                chunk_uid = f"{doc_id}::{c_id}"
+                orig_source_path = chunk.get("source_path")
 
                 meta: Dict[str, Any] = {
                     "doc_id": doc_id,
                     "chunk_id": c_id,
-                    "source_path": source_path,
+                    "chunk_uid": chunk_uid,
+                    "source_path": orig_source_path or source_path,
+                    "record_ref": source_path,
                     "source_type": chunk.get("source_type"),
-                    "language": chunk.get("language"),
+                    "language": lang,
                     "meta": chunk.get("meta", {}),
                     "semantic": semantic,
-                    # flache Convenience-Felder für Filter:
                     "trust_level": semantic.get("trust_level"),
                     "content_type": semantic.get("content_type"),
                     "domain": semantic.get("domain"),
@@ -233,7 +238,7 @@ def collect_chunks(
 
                 texts.append(text)
                 metas.append(meta)
-                chunk_ids.append(str(c_id))
+                chunk_ids.append(chunk_uid)
                 num_chunks += 1
 
                 if max_chunks is not None and num_chunks >= max_chunks:
@@ -249,7 +254,6 @@ def collect_chunks(
                     return texts, metas, chunk_ids
 
         elif lower.endswith(".jsonl"):
-            # JSON Lines: jede Zeile ein Dokument / Chunk
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     for line_no, line in enumerate(f, start=1):
@@ -278,21 +282,35 @@ def collect_chunks(
                                 )
                                 continue
 
+                            semantic = chunk.get("semantic", {}) or {}
+
+                            artifact_role = semantic.get("artifact_role") or []
+                            if isinstance(artifact_role, str):
+                                artifact_role = [artifact_role]
+                            if "structural" in artifact_role:
+                                continue
+
+                            lang = semantic.get("language") or chunk.get("language")
+                            if exclude_unknown and lang == "unknown":
+                                continue
+
                             text = build_text_from_chunk(chunk)
                             if not text.strip():
                                 continue
 
-                            semantic = chunk.get("semantic", {}) or {}
+                            chunk_uid = f"{doc_id}::{c_id}"
+                            orig_source_path = chunk.get("source_path")
 
                             meta = {
                                 "doc_id": doc_id,
                                 "chunk_id": c_id,
-                                "source_path": source_path,
+                                "chunk_uid": chunk_uid,
+                                "source_path": orig_source_path or source_path,
+                                "record_ref": source_path,
                                 "source_type": chunk.get("source_type"),
-                                "language": chunk.get("language"),
+                                "language": lang,
                                 "meta": chunk.get("meta", {}),
                                 "semantic": semantic,
-                                # flache Convenience-Felder für Filter:
                                 "trust_level": semantic.get("trust_level"),
                                 "content_type": semantic.get("content_type"),
                                 "domain": semantic.get("domain"),
@@ -300,7 +318,7 @@ def collect_chunks(
 
                             texts.append(text)
                             metas.append(meta)
-                            chunk_ids.append(str(c_id))
+                            chunk_ids.append(chunk_uid)
                             num_chunks += 1
 
                             if max_chunks is not None and num_chunks >= max_chunks:
@@ -314,6 +332,18 @@ def collect_chunks(
                                     num_chunks,
                                 )
                                 return texts, metas, chunk_ids
+
+            except Exception as exc:
+                logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)
+                continue
+
+    logger.info(
+        "Sammlung abgeschlossen. Dateien: %d, Chunks: %d",
+        num_files,
+        num_chunks,
+    )
+    return texts, metas, chunk_ids
+
 
             except Exception as exc:
                 logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)
@@ -440,6 +470,11 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help="Embeddings L2-normalisieren und IndexFlatIP (Cosine-Suche) verwenden.",
     )
     parser.add_argument(
+        "--exclude-unknown",
+        action="store_true",
+        help="Optional: Chunks mit language=='unknown' nicht indizieren.",
+    )
+    parser.add_argument(
         "--max-chunks",
         type=int,
         default=None,
@@ -463,6 +498,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+
 def main(argv: List[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -484,20 +520,21 @@ def main(argv: List[str] | None = None) -> int:
         normalized_root=normalized_root,
         logger=logger,
         max_chunks=args.max_chunks,
+        exclude_unknown=bool(args.exclude_unknown),
     )
 
     if not texts:
         logger.error("Keine Chunks gefunden – Abbruch.")
         return 1
 
-    # Check auf doppelte chunk_id
     unique_chunk_ids = len(set(chunk_ids))
     if unique_chunk_ids != len(chunk_ids):
-        logger.warning(
-            "Es gibt doppelte chunk_id-Werte: %d unique von %d Gesamt.",
+        logger.error(
+            "Es gibt doppelte chunk_uid-Werte: %d unique von %d Gesamt.",
             unique_chunk_ids,
             len(chunk_ids),
         )
+        return 1
 
     logger.info(
         "Starte Embedding-Berechnung mit Modell '%s' auf Gerät '%s'.",
