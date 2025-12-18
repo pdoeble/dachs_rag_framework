@@ -1,17 +1,9 @@
 {
-  "version": "0.1.0",
-  "description": "Config for generate_qa_candidates: Auswahl von Chunks, Kontextbau mit FAISS und LLM-QA-Erzeugung.",
+  "version": "0.2.0",
+  "description": "Config for generate_qa_candidates: Chunk-Auswahl, Kontextbau (FAISS) und LLM-QA-Erzeugung. Pfade kommen aus config/paths/paths.json.",
 
   "paths": {
-    "workspace_root": "/beegfs/scratch/workspace/es_phdoeble-rag_pipeline",
-    "semantic_dir": "semantic/json",
-    "qa_candidates_dir": "qa_candidates/jsonl",
-
-    "faiss_index_dir": "indices/faiss",
-    "faiss_index_filename": "contextual.index",
-    "faiss_meta_filename": "contextual_meta.jsonl",
-    "faiss_config_filename": "contextual_config.json",
-
+    "paths_file": "config/paths/paths.json",
     "prompt_system_file": "config/prompts/qa_generation_system.txt",
     "prompt_user_template_file": "config/prompts/qa_generation_user.txt"
   },
@@ -19,26 +11,13 @@
   "filters": {
     "languages_allowed": ["de", "en"],
     "trust_levels_allowed": ["high", "medium"],
-    "chunk_roles_allowed": [
-      "definition",
-      "explanation",
-      "example",
-      "key_result",
-      "exercise"
-    ],
-    "content_types_allowed": [
-      "textbook",
-      "handbook",
-      "paper",
-      "simulation_report",
-      "api_doc",
-      "software_manual"
-    ]
+    "chunk_roles_allowed": ["definition", "explanation", "example", "key_result", "exercise"],
+    "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"]
   },
 
   "neighbors": {
     "top_k_faiss": 16,
-    "similarity_threshold": 0.20,
+    "similarity_threshold": 0.2,
     "max_neighbors": 8,
     "max_local_neighbors_before": 1,
     "max_local_neighbors_after": 1
@@ -64,7 +43,6 @@
     "temperature": 0.2,
     "top_p": 0.9,
     "max_tokens": 1024,
-
     "request_timeout_s": 60,
     "max_retries": 3,
     "retry_backoff_s": 5.0
