@@ -468,6 +468,8 @@ def call_llm_ollama(
         "options": {
             "temperature": float(temperature),
             "top_p": float(top_p),
+            # Ollama: maximale Anzahl generierter Tokens
+            "num_predict": int(max_tokens),
         },
     }
 
