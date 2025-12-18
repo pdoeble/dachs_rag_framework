@@ -331,19 +331,7 @@ def collect_chunks(
                                     num_files,
                                     num_chunks,
                                 )
-                                return texts, metas, chunk_ids
-
-            except Exception as exc:
-                logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)
-                continue
-
-    logger.info(
-        "Sammlung abgeschlossen. Dateien: %d, Chunks: %d",
-        num_files,
-        num_chunks,
-    )
-    return texts, metas, chunk_ids
-
+                    return texts, metas, chunk_ids
 
             except Exception as exc:
                 logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)

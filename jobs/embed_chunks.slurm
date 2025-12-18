@@ -9,19 +9,19 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=logs/embed_chunks_%j.out
 
-# defensives Bash-Setup
 set -euo pipefail
 
-# saubere Umgebung
 module purge
 module load devel/python/3.12.3-gnu-14.2
 
-# Python-Umgebung aktivieren
 source "$HOME/venv/dachs_rag_312/bin/activate"
 cd "$HOME/dachs_rag_framework"
 
-# Log-Verzeichnis im Repo sicherstellen
 mkdir -p logs
+
+# HF cache (avoid downloads on compute nodes)
+export HF_HOME="$HOME/.cache/huggingface"
+export TRANSFORMERS_CACHE="$HF_HOME"
 
 # workspace_root aus config/paths/paths.json auflösen
 WORKSPACE_ROOT=$(python - << 'EOF'
@@ -44,12 +44,22 @@ print(cfg["workspace_root"])
 EOF
 )
 
-# Zielverzeichnisse im Workspace sicherstellen
 mkdir -p "$WORKSPACE_ROOT/indices/faiss" \
          "$WORKSPACE_ROOT/indices/chroma" \
          "$WORKSPACE_ROOT/logs/indices"
 
-# Embeddings für alle Chunks erzeugen
+# Quick sanity checks (GPU + CUDA sichtbar?)
+python - << 'EOF'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+else:
+    raise SystemExit("ERROR: CUDA nicht verfügbar -> CPU-Fallback (Zeit/12h evtl. unrealistisch)")
+EOF
+
 python scripts/embed_chunks.py \
   --workspace-root "$WORKSPACE_ROOT" \
-
+  --normalize \
+  --exclude-unknown
