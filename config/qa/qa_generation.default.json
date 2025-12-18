@@ -1,6 +1,6 @@
 {
-  "version": "0.2.0",
-  "description": "Config for generate_qa_candidates: Chunk-Auswahl, Kontextbau (FAISS) und LLM-QA-Erzeugung. Pfade kommen aus config/paths/paths.json.",
+  "version": "0.3.0",
+  "description": "Config for generate_qa_candidates: stricter grounding + robust defaults for partially-missing semantic tags.",
 
   "paths": {
     "paths_file": "config/paths/paths.json",
@@ -11,28 +11,40 @@
   "filters": {
     "languages_allowed": ["de", "en"],
     "trust_levels_allowed": ["high", "medium"],
+
     "chunk_roles_allowed": ["definition", "explanation", "example", "key_result", "exercise"],
-    "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"]
+    "allow_missing_chunk_role": true,
+
+    "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"],
+
+    "min_content_chars": 200
   },
 
   "neighbors": {
-    "top_k_faiss": 16,
-    "similarity_threshold": 0.2,
+    "top_k_faiss": 24,
+    "similarity_threshold": 0.25,
     "max_neighbors": 8,
+
     "max_local_neighbors_before": 1,
-    "max_local_neighbors_after": 1
+    "max_local_neighbors_after": 1,
+
+    "prefer_same_doc_if_domain_missing": true,
+    "prefer_same_doc_if_content_type_missing": true
   },
 
   "grouping": {
     "min_group_size": 2,
     "max_group_size": 6,
-    "max_tokens_context": 4096
+
+    "max_chars_per_chunk": 1200,
+    "max_total_context_chars": 12000
   },
 
   "sampling": {
-    "max_qa_per_group": 3,
+    "max_qa_per_group": 2,
     "max_groups_per_chunk": 1,
     "max_qa_per_document": 50,
+
     "global_qa_limit": 20000,
     "sampling_strategy": "sequential"
   },
@@ -42,7 +54,8 @@
     "model": "qwen2.5:32b-instruct-q4_K_M",
     "temperature": 0.0,
     "top_p": 0.9,
-    "max_tokens": 1024,
+    "max_tokens": 900,
+
     "request_timeout_s": 300,
     "max_retries": 3,
     "retry_backoff_s": 5.0
@@ -53,8 +66,14 @@
     "shuffle_files": true,
     "resume_mode": "append",
     "dry_run": false,
+
     "log_level": "INFO",
-    "log_every_n_examples": 50
+    "log_every_n_examples": 50,
+
+    "grounding_enabled": true,
+    "grounding_min_coverage_question": 0.55,
+    "grounding_min_coverage_answer": 0.45,
+    "grounding_drop_if_meta_leak": true
   },
 
   "output": {
@@ -67,6 +86,7 @@
   "debug": {
     "limit_num_files": 0,
     "limit_num_chunks": 0,
+
     "dump_example_prompts": false,
     "example_prompts_dir": "logs/qa_prompts"
   }
