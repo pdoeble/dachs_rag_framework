@@ -710,7 +710,7 @@ def process_semantic_file(
         top_k_faiss = int(neighbors_cfg.get("top_k_faiss", 16))
         try:
             faiss_neighbors = retriever.get_neighbors_for_chunk(
-                chunk_id=chunk_id,
+                chunk_id_or_uid=chunk_id,
                 top_k=top_k_faiss,
             )
         except Exception as e:

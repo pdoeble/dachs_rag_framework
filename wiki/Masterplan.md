@@ -1455,6 +1455,19 @@ Dieses Skript baut den FAISS-Kontextindex auf und speichert Metadaten und Index-
     - `num_vectors`,  
     - `normalized` (bool),  
     - `device` (z. B. `cuda` oder `cpu`).
+    - `metric` (`IP` oder `L2`) – Interpretation der Retrieval-Scores (Ähnlichkeit vs. Distanz).
+
+
+**Score-Richtung (wichtig für Sortierung / Filtering)**
+
+- Wenn `metric == "IP"` / `index_type == "IndexFlatIP"`:
+  - FAISS liefert **Inner Product**. Bei `normalized == true` ist das cosine-ähnliche Ähnlichkeit.
+  - **höher = besser** (absteigend sortieren).
+- Wenn `metric == "L2"` / `index_type == "IndexFlatL2"`:
+  - FAISS liefert **L2-Distanz**.
+  - **kleiner = besser** (aufsteigend sortieren).
+
+**Verbindliche Regel:** Downstream-Module dürfen die Sortierreihenfolge nicht hardcoden (z. B. „immer absteigend“), sondern müssen sie aus `indices/faiss/contextual_config.json` ableiten.
 
 **Wichtige CLI-Argumente**
 
@@ -1506,25 +1519,25 @@ solche Indizes aufbauen. Dabei können Embeddings wiederverwendet werden (z. B
 
 ---
 
-
 ### 6.5.3 Retrieval-API auf FAISS-Basis (`faiss_retriever.py`)
 
 Der Kontextindex aus 6.5.1 wird für Semantik (6.2) und Q/A (6.3) über ein zentrales Helfermodul angebunden:
 
-- Modul/Skript: `scripts/faiss_retriever.py`  
-- Kernklasse: `FaissRetriever`  
+- Modul/Skript: `scripts/faiss_retriever.py`
+- Kernklasse: `FaissRetriever`
 
 **Aufgaben von `FaissRetriever`:**
 
 - Laden des Kontextindex aus einem Workspace:
   - `indices/faiss/contextual.index`,
-  - `indices/faiss/contextual_meta.jsonl`.
-- Aufbau einer Map `chunk_id → faiss_id` aus den Metadaten.
+  - `indices/faiss/contextual_meta.jsonl`,
+  - optional: `indices/faiss/contextual_config.json` (Index-Typ / Metrik / Normalisierung).
+- Aufbau einer Map `chunk_id → faiss_id` (und optional `chunk_uid → faiss_id`) aus den Metadaten.
 - Konsistenzprüfung:
   - Anzahl Metadatensätze == `index.ntotal`.
 - Bereitstellen von Methoden für:
-  - Lookup der Indexposition (`faiss_id`) zu einer gegebenen `chunk_id`,
-  - Rekonstruktion einzelner Vektoren,
+  - Lookup der Indexposition (`faiss_id`) zu einer gegebenen `chunk_id` / `chunk_uid`,
+  - Rekonstruktion einzelner Vektoren (für FLAT-Indizes),
   - k-NN-Suche in „Chunk-Space“ für einen gegebenen Chunk.
 
 **Zentrales API (Python):**
@@ -1542,7 +1555,7 @@ vec = retriever.reconstruct_vector(faiss_id)  # Shape: (1, dim)
 
 # 3) Nachbarn für einen Chunk holen
 neighbors = retriever.get_neighbors_for_chunk(
-    chunk_id="some_chunk_id",
+    chunk_id_or_uid="some_chunk_id",
     top_k=5,
     include_self=False,
 )
@@ -1552,9 +1565,30 @@ Jeder Eintrag in `neighbors` ist ein Dict mit:
 
 - `faiss_id` – Indexposition im FAISS-Index,
 - `score` – Distanz oder Ähnlichkeit (abhängig vom Index-Typ),
-- `chunk_id`, `doc_id`, `source_path`, `source_type`, `language`,
-- `meta`, `semantic`,
-- flachen Convenience-Feldern (`trust_level`, `content_type`, `domain`), falls in `contextual_meta.jsonl` vorhanden.
+- Metadaten aus `contextual_meta.jsonl` (z. B. `chunk_id`, `chunk_uid`, `doc_id`, `source_path`, `source_type`, `language`, `meta`, `semantic`),
+- optional flache Convenience-Felder (`trust_level`, `content_type`, `domain`), falls in `contextual_meta.jsonl` vorhanden.
+
+#### Score-Semantik und Sortierung
+
+- `FaissRetriever` gibt den von FAISS `index.search()` gelieferten Wert **roh** als `score` zurück (keine Transformation wie `-distance`, `1-distance`, …).
+- Interpretation hängt ausschließlich vom Index-Typ ab (Quelle: `indices/faiss/contextual_config.json`):
+  - `IndexFlatIP` / `metric == "IP"`: `score` ist **Ähnlichkeit (Inner Product)** ⇒ **höher = besser**.
+  - `IndexFlatL2` / `metric == "L2"`: `score` ist **Distanz (L2)** ⇒ **kleiner = besser**.
+- Jede Komponente, die Nachbarn sortiert/filtern will (z. B. `generate_qa_candidates.py: filter_faiss_neighbors()`), muss die Richtung aus `contextual_config.json` ableiten und darf sie nicht hardcoden.
+
+#### Verifizierte Erkenntnis im aktuellen Workspace (es_phdoeble-rag_pipeline)
+
+Im Workspace `/beegfs/scratch/workspace/es_phdoeble-rag_pipeline` ist der Index wie folgt gebaut:
+
+- `metric`: `IP`
+- `normalized`: `true`
+- `index_type`: `IndexFlatIP`
+
+Konsequenz:
+
+- `score` ist Similarity (Inner Product auf normalisierten Vektoren, praktisch cosine-ähnlich) ⇒ **höher = besser**.
+- Absteigende Sortierung und ein Filter der Form `if score < similarity_threshold: skip` sind für diesen Workspace korrekt.
+- Trotzdem bleibt die Anforderung bestehen, die Richtung immer aus `contextual_config.json` zu lesen, um Index-Wechsel (IP ↔ L2) sicher zu unterstützen.
 
 **Backward-Kompatibilität:**
 
@@ -1563,10 +1597,8 @@ Jeder Eintrag in `neighbors` ist ein Dict mit:
 
 **CLI-Testmodus:**
 
-Das Skript kann direkt von der Kommandozeile genutzt werden, um Nachbarn für eine gegebene `chunk_id` zu inspizieren:
-
 ```bash
-python scripts/faiss_retriever.py     --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline     --chunk-id SOME_CHUNK_ID     --top-k 5
+python scripts/faiss_retriever.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --chunk-id SOME_CHUNK_ID_OR_UID   --top-k 5
 ```
 
 Ausgabe (Beispiel, pro Treffer eine Zeile):
@@ -1574,7 +1606,7 @@ Ausgabe (Beispiel, pro Treffer eine Zeile):
 - Score (Distanz/Ähnlichkeit),
 - `faiss_id`,
 - `doc_id`,
-- `chunk_id`,
+- `chunk_id` / `chunk_uid`,
 - `source_path`.
 
 **Nutzung in anderen Modulen:**
@@ -1583,7 +1615,7 @@ Ausgabe (Beispiel, pro Treffer eine Zeile):
   - nutzt `FaissRetriever.get_neighbors_for_chunk(...)`, um Retrieval-Kontext für die semantische Anreicherung zu holen.
 - `generate_qa_candidates.py`:
   - nutzt denselben Retriever für die Bildung semantischer Kontextgruppen (ähnliche Chunks + lokale Nachbarn).
-- Optionale weitere Komponenten (z. B. KNIME-Workflows, Analyse-Skripte) können ebenfalls über `FaissRetriever` auf den Kontextindex zugreifen, ohne selbst FAISS- und Meta-Handling implementieren zu müssen.
+- Optionale weitere Komponenten können ebenfalls über `FaissRetriever` auf den Kontextindex zugreifen, ohne selbst FAISS- und Meta-Handling implementieren zu müssen.
 
 ## 6.6 (optional) Labelpropagation & Nachbarschafts-Konsistenz
 

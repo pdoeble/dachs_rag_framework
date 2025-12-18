@@ -3,16 +3,16 @@
 faiss_retriever.py
 
 Hilfsmodul zum Laden des FAISS-Index aus dem Workspace und
-Retrieval von Nachbar-Chunks auf Basis von chunk_id.
+Retrieval von Nachbar-Chunks auf Basis von chunk_id (oder chunk_uid).
 
 Wird später aus annotate_semantics.py / generate_qa_candidates.py verwendet,
-um ähnliche Chunks für Kontext hinzuzuziehen.
+um ähnliche Chunks für Kontext hinzuziehen.
 
 Beispiel (CLI-Test):
 
   python scripts/faiss_retriever.py \
       --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline \
-      --chunk-id SOME_CHUNK_ID \
+      --chunk-id SOME_CHUNK_ID_OR_UID \
       --top-k 5
 """
 
@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -36,7 +36,7 @@ class FaissRetriever:
     Kapselt:
     - Laden des FAISS-Index
     - Laden der JSONL-Metadaten
-    - Mapping chunk_id -> faiss_id (Indexposition)
+    - Mapping chunk_id/chunk_uid -> faiss_id (Indexposition)
     - Nachbarschaftssuche pro Chunk
     """
 
@@ -59,16 +59,17 @@ class FaissRetriever:
         # Index laden
         self.index = faiss.read_index(self.index_path)
 
-        # Metadaten laden
-        self.meta: List[Dict[str, Any]] = []
-        # Primäre Map: chunk_id -> faiss_id (Indexposition)
+        # Metadaten laden: positionsstabil per faiss_id
+        self.meta: List[Dict[str, Any]] = [{} for _ in range(self.index.ntotal)]
         self.chunkid_to_faissid: Dict[str, int] = {}
 
+        filled = 0
         with open(self.meta_path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
+
                 rec = json.loads(line)
 
                 # Neues Schema: faiss_id
@@ -76,37 +77,47 @@ class FaissRetriever:
                 # Fallback auf altes Schema: vector_id (für ältere Indizes)
                 if faiss_id is None:
                     faiss_id = rec.get("vector_id")
-
-                chunk_id = rec.get("chunk_id")
-
-                if faiss_id is None or chunk_id is None:
-                    # unvollständiger Record -> überspringen
+                if faiss_id is None:
                     continue
 
-                faiss_id_int = int(faiss_id)
+                fid = int(faiss_id)
+                if fid < 0 or fid >= self.index.ntotal:
+                    continue
 
-                self.meta.append(rec)
-                self.chunkid_to_faissid[str(chunk_id)] = faiss_id_int
+                chunk_id = rec.get("chunk_id")
+                chunk_uid = rec.get("chunk_uid")
 
-        if len(self.meta) != self.index.ntotal:
+                if chunk_id is None and chunk_uid is None:
+                    continue
+
+                self.meta[fid] = rec
+                filled += 1
+
+                # beide Keys unterstützen
+                if chunk_id is not None:
+                    self.chunkid_to_faissid[str(chunk_id)] = fid
+                if chunk_uid is not None:
+                    self.chunkid_to_faissid[str(chunk_uid)] = fid
+
+        if filled != self.index.ntotal:
             raise RuntimeError(
-                f"Anzahl Metadaten ({len(self.meta)}) ungleich Index-Vektoren ({self.index.ntotal})."
+                f"Metadaten unvollständig: {filled} von {self.index.ntotal} Records geladen."
             )
 
-    def get_faiss_id_for_chunk(self, chunk_id: str) -> int:
+    def get_faiss_id_for_chunk(self, chunk_id_or_uid: str) -> int:
         """
-        Gibt die faiss_id (Indexposition im FAISS-Index) für eine gegebene chunk_id zurück.
+        Gibt die faiss_id (Indexposition im FAISS-Index) für eine gegebene chunk_id oder chunk_uid zurück.
         """
         try:
-            return self.chunkid_to_faissid[chunk_id]
+            return self.chunkid_to_faissid[chunk_id_or_uid]
         except KeyError as exc:
-            raise KeyError(f"chunk_id nicht im Index gefunden: {chunk_id}") from exc
+            raise KeyError(f"chunk_id/chunk_uid nicht im Index gefunden: {chunk_id_or_uid}") from exc
 
-    def get_vector_id_for_chunk(self, chunk_id: str) -> int:
+    def get_vector_id_for_chunk(self, chunk_id_or_uid: str) -> int:
         """
         Alias für get_faiss_id_for_chunk, für Rückwärtskompatibilität.
         """
-        return self.get_faiss_id_for_chunk(chunk_id)
+        return self.get_faiss_id_for_chunk(chunk_id_or_uid)
 
     def reconstruct_vector(self, faiss_id: int) -> np.ndarray:
         """
@@ -122,12 +133,12 @@ class FaissRetriever:
 
     def get_neighbors_for_chunk(
         self,
-        chunk_id: str,
+        chunk_id_or_uid: str,
         top_k: int = 5,
         include_self: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Liefert die Top-k Nachbar-Chunks für eine gegebene chunk_id.
+        Liefert die Top-k Nachbar-Chunks für eine gegebene chunk_id oder chunk_uid.
 
         Rückgabe: Liste von Dicts mit:
           - 'score'    (Ähnlichkeit oder Distanz, je nach Index)
@@ -136,7 +147,7 @@ class FaissRetriever:
 
         Wenn include_self=False, wird der Chunk selbst aus den Ergebnissen entfernt.
         """
-        faiss_id = self.get_faiss_id_for_chunk(chunk_id)
+        faiss_id = self.get_faiss_id_for_chunk(chunk_id_or_uid)
         query_vec = self.reconstruct_vector(faiss_id)
 
         # Wir holen bewusst etwas mehr und filtern ggf. uns selbst raus
@@ -152,7 +163,6 @@ class FaissRetriever:
                 continue
 
             if idx >= len(self.meta):
-                # Sollte nicht passieren, aber wir sind lieber defensiv
                 continue
 
             rec = dict(self.meta[idx])  # Kopie
@@ -168,34 +178,32 @@ class FaissRetriever:
 
 def _cli_print_neighbors(
     workspace_root: str,
-    chunk_id: str,
+    chunk_id_or_uid: str,
     top_k: int,
 ) -> None:
-    """
-    Hilfsfunktion für den CLI-Modus: lädt den Retriever und druckt Nachbarn.
-    """
     retriever = FaissRetriever(workspace_root=workspace_root)
 
     neighbors = retriever.get_neighbors_for_chunk(
-        chunk_id=chunk_id,
+        chunk_id_or_uid=chunk_id_or_uid,
         top_k=top_k,
         include_self=False,
     )
 
-    print(f"Top-{top_k} Nachbarn für chunk_id={chunk_id}:")
+    print(f"Top-{top_k} Nachbarn für chunk_id/chunk_uid={chunk_id_or_uid}:")
     for i, rec in enumerate(neighbors, start=1):
         doc_id = rec.get("doc_id")
         nid = rec.get("chunk_id")
+        nuid = rec.get("chunk_uid")
         score = rec.get("score")
         source_path = rec.get("source_path")
         faiss_id = rec.get("faiss_id")
-        print(f"{i:2d}. score={score:.4f}  faiss_id={faiss_id}  doc_id={doc_id}  chunk_id={nid}")
+        print(f"{i:2d}. score={score:.4f}  faiss_id={faiss_id}  doc_id={doc_id}  chunk_id={nid}  chunk_uid={nuid}")
         print(f"    source_path={source_path}")
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FAISS-Retriever für Nachbar-Chunks (auf Basis von chunk_id)."
+        description="FAISS-Retriever für Nachbar-Chunks (auf Basis von chunk_id/chunk_uid)."
     )
     parser.add_argument(
         "--workspace-root",
@@ -204,7 +212,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--chunk-id",
-        help="chunk_id, für die Nachbarn gesucht werden sollen (CLI-Test).",
+        help="chunk_id oder chunk_uid, für die Nachbarn gesucht werden sollen (CLI-Test).",
     )
     parser.add_argument(
         "--top-k",
@@ -221,12 +229,12 @@ def main(argv: List[str] | None = None) -> int:
     if args.chunk_id:
         _cli_print_neighbors(
             workspace_root=args.workspace_root,
-            chunk_id=args.chunk_id,
+            chunk_id_or_uid=args.chunk_id,
             top_k=args.top_k,
         )
     else:
         print(
-            "Hinweis: Für einen schnellen Test bitte --chunk-id <ID> angeben.",
+            "Hinweis: Für einen schnellen Test bitte --chunk-id <ID oder UID> angeben.",
             file=sys.stderr,
         )
     return 0
