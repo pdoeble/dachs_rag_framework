@@ -28,6 +28,9 @@ export OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT}"
 export OLLAMA_API_URL="http://127.0.0.1:${OLLAMA_PORT}/api/chat"
 export NO_PROXY="127.0.0.1,localhost"
 
+# Performance: Modell nicht sofort entladen
+export OLLAMA_KEEP_ALIVE=30m
+
 # Ollama server starten
 OLLAMA_LOG="/tmp/ollama_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log"
 ollama serve >"${OLLAMA_LOG}" 2>&1 &
@@ -66,13 +69,23 @@ ss -ltnp 2>/dev/null | grep -q "${OLLAMA_PORT}.*pid=${OLLAMA_PID}" || {
   exit 1
 }
 
-# Optional: Modell-Tag prüfen (empfohlen, sonst droht 404=model not found)
+# Modell-Tag prüfen (sonst droht 404=model not found)
 MODEL_TAG="qwen2.5:32b-instruct-q4_K_M"
 curl -fsS "http://127.0.0.1:${OLLAMA_PORT}/api/tags" | grep -q "\"${MODEL_TAG}\"" || {
   echo "ERROR: Model '${MODEL_TAG}' not found on this node (check /api/tags). Log:" >&2
   tail -n 80 "${OLLAMA_LOG}" >&2 || true
   exit 2
 }
+
+# Performance: Warmup (lädt Modell einmalig, bevor Python in die Schleife geht)
+curl -fsS -X POST "http://127.0.0.1:${OLLAMA_PORT}/api/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"'"${MODEL_TAG}"'","messages":[{"role":"user","content":"Warmup. Reply OK."}],"stream":false}' \
+  >/dev/null || {
+    echo "ERROR: Warmup call failed on port ${OLLAMA_PORT}. Log:" >&2
+    tail -n 120 "${OLLAMA_LOG}" >&2 || true
+    exit 3
+  }
 
 python scripts/generate_qa_candidates.py \
   --workspace-root "${WORKSPACE}" \

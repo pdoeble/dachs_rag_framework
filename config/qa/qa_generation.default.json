@@ -40,10 +40,10 @@
   "llm": {
     "backend": "ollama",
     "model": "qwen2.5:32b-instruct-q4_K_M",
-    "temperature": 0.2,
+    "temperature": 0.0,
     "top_p": 0.9,
     "max_tokens": 1024,
-    "request_timeout_s": 60,
+    "request_timeout_s": 300,
     "max_retries": 3,
     "retry_backoff_s": 5.0
   },
