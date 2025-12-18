@@ -243,12 +243,23 @@ def is_candidate_chunk(chunk: Dict[str, Any], cfg: QAConfig) -> bool:
         return False
 
     trust_level = get_semantic_field(chunk, "trust_level")
-    if trust_allowed and trust_level not in trust_allowed:
-        return False
+    if trust_allowed:
+        if isinstance(trust_level, list):
+            if not (set(str(v) for v in trust_level) & trust_allowed):
+                return False
+        else:
+            if trust_level not in trust_allowed:
+                return False
 
     chunk_role = get_semantic_field(chunk, "chunk_role")
-    if roles_allowed and chunk_role not in roles_allowed:
-        return False
+    if roles_allowed:
+        if isinstance(chunk_role, list):
+            if not (set(str(v) for v in chunk_role) & roles_allowed):
+                return False
+        else:
+            if chunk_role not in roles_allowed:
+                return False
+
 
     content_types = get_flat_list_field(chunk, "content_type")
     if content_types_allowed and not (set(content_types) & content_types_allowed):
@@ -462,9 +473,33 @@ def call_llm_ollama_once(
     }
 
     resp = requests.post(url, json=payload, timeout=timeout_s)
+    if resp.status_code == 404:
+        # Fallback: OpenAI-kompatibler Endpoint
+        base = url.split("/api/chat")[0]
+        v1_url = base + "/v1/chat/completions"
+
+        v1_payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens),
+        }
+
+        resp = requests.post(v1_url, json=v1_payload, timeout=timeout_s)
     resp.raise_for_status()
     data = resp.json()
-
+    # /api/chat -> {"message":{"content":...}}
+    if "message" in data:
+        content = (data.get("message") or {}).get("content") or ""
+    # /v1/chat/completions -> {"choices":[{"message":{"content":...}}]}
+    else:
+        choices = data.get("choices") or []
+        content = (((choices[0] if choices else {}) .get("message") or {}).get("content")) or ""
     message = data.get("message") or {}
     content = message.get("content") or ""
     if not isinstance(content, str):
@@ -475,8 +510,7 @@ def call_llm_ollama_once(
         raise ValueError("LLM-Output ist kein JSON-Array.")
     return parsed
 
-
-def call_llm_ollama_with_retries(
+def call_llm_ollama(
     system_prompt: str,
     user_prompt: str,
     model: str,
@@ -484,32 +518,114 @@ def call_llm_ollama_with_retries(
     top_p: float,
     max_tokens: int,
     timeout_s: int,
-    max_retries: int,
-    retry_backoff_s: float,
 ) -> List[Dict[str, Any]]:
-    last_err: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            return call_llm_ollama_once(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=model,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                timeout_s=timeout_s,
-            )
-        except Exception as e:
-            last_err = e
-            if attempt >= max_retries:
-                break
-            sleep_s = retry_backoff_s * (2.0**attempt)
-            sleep_s = sleep_s * (0.9 + 0.2 * random.random())
-            time.sleep(max(0.0, sleep_s))
+    """
+    Robuster Ollama-Call:
+    - versucht /api/chat
+    - fallback: /v1/chat/completions
+    - fallback: /api/generate (ältere Ollama-Instanzen)
+    Erwartet am Ende immer JSON-Array im Text.
+    """
+    base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    # Wenn OLLAMA_API_URL gesetzt ist, nehmen wir deren Base (ohne Pfad)
+    api_url_env = os.environ.get("OLLAMA_API_URL")
+    if api_url_env:
+        # z.B. http://127.0.0.1:11434/api/chat  -> base=http://127.0.0.1:11434
+        base = api_url_env.split("/api/")[0].split("/v1/")[0].rstrip("/")
 
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("Unbekannter Fehler beim LLM-Aufruf.")
+    # ---------- 1) /api/chat ----------
+    chat_url = f"{base}/api/chat"
+    payload_chat = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+        },
+    }
+
+    try:
+        resp = requests.post(chat_url, json=payload_chat, timeout=timeout_s)
+        if resp.status_code != 404:
+            resp.raise_for_status()
+            data = resp.json()
+            content = ((data.get("message") or {}).get("content")) or ""
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Ollama /api/chat: keine Content-Antwort.")
+            parsed = extract_json_from_text(content)
+            if not isinstance(parsed, list):
+                raise ValueError("LLM-Output ist kein JSON-Array.")
+            return parsed
+    except requests.HTTPError:
+        raise
+    except Exception:
+        # wir probieren Fallbacks
+        pass
+
+    # ---------- 2) /v1/chat/completions ----------
+    v1_url = f"{base}/v1/chat/completions"
+    payload_v1 = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_tokens": int(max_tokens),
+    }
+
+    try:
+        resp = requests.post(v1_url, json=payload_v1, timeout=timeout_s)
+        if resp.status_code != 404:
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices") or []
+            content = ""
+            if choices:
+                content = (((choices[0] or {}).get("message") or {}).get("content")) or ""
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Ollama /v1/chat/completions: keine Content-Antwort.")
+            parsed = extract_json_from_text(content)
+            if not isinstance(parsed, list):
+                raise ValueError("LLM-Output ist kein JSON-Array.")
+            return parsed
+    except requests.HTTPError:
+        raise
+    except Exception:
+        pass
+
+    # ---------- 3) /api/generate ----------
+    gen_url = f"{base}/api/generate"
+    # system+user zu einem Prompt zusammenführen
+    combined = system_prompt.strip() + "\n\n" + user_prompt.strip()
+    payload_gen = {
+        "model": model,
+        "prompt": combined,
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            # manche Ollama-Versionen akzeptieren num_predict statt max_tokens
+            "num_predict": int(max_tokens),
+        },
+    }
+
+    resp = requests.post(gen_url, json=payload_gen, timeout=timeout_s)
+    resp.raise_for_status()
+    data = resp.json()
+    content = data.get("response") or ""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Ollama /api/generate: keine response-Antwort.")
+    parsed = extract_json_from_text(content)
+    if not isinstance(parsed, list):
+        raise ValueError("LLM-Output ist kein JSON-Array.")
+    return parsed
 
 
 def build_context_text_for_prompt(

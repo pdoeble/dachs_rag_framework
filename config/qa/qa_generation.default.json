@@ -39,7 +39,7 @@
 
   "llm": {
     "backend": "ollama",
-    "model": "llama3.1:8b-instruct",
+    "model": "qwen2.5:32b-instruct-q4_K_M",
     "temperature": 0.2,
     "top_p": 0.9,
     "max_tokens": 1024,
