@@ -110,16 +110,19 @@ def extract_chunks_from_doc(
     Extrahiert Chunks aus einem geladenen JSON-Dokument.
 
     Unterstützte Formen:
-    - Ein einzelnes Chunk-Objekt (dict mit 'content' etc.)
+    - Ein einzelnes Chunk-Objekt (dict mit 'content' oder 'text')
     - Eine Liste von Chunk-Objekten (list[dict])
     - Ein Dokument mit Feld 'chunks': list[dict]
     """
+    def _has_text_field(d: Dict[str, Any]) -> bool:
+        return ("content" in d) or ("text" in d)
+
     if isinstance(doc, dict):
-        if "content" in doc:
+        if _has_text_field(doc):
             yield doc, source_path
         elif "chunks" in doc and isinstance(doc["chunks"], list):
             for chunk in doc["chunks"]:
-                if isinstance(chunk, dict) and "content" in chunk:
+                if isinstance(chunk, dict) and _has_text_field(chunk):
                     yield chunk, source_path
                 else:
                     logger.debug(
@@ -129,13 +132,13 @@ def extract_chunks_from_doc(
                     )
         else:
             logger.debug(
-                "JSON in %s hat kein 'content' oder 'chunks'-Feld. Typ=%s",
+                "JSON in %s hat kein 'content'/'text' oder 'chunks'-Feld. Typ=%s",
                 source_path,
                 type(doc),
             )
     elif isinstance(doc, list):
         for chunk in doc:
-            if isinstance(chunk, dict) and "content" in chunk:
+            if isinstance(chunk, dict) and _has_text_field(chunk):
                 yield chunk, source_path
             else:
                 logger.debug(
@@ -152,11 +155,10 @@ def extract_chunks_from_doc(
 
 
 def build_text_from_chunk(chunk: Dict[str, Any]) -> str:
-    """
-    Erzeugt den Text, der in den Embedding-Encoder geht.
-    """
     title = chunk.get("title")
-    content = chunk.get("content", "")
+    content = chunk.get("content")
+    if content is None:
+        content = chunk.get("text", "")
 
     if not isinstance(content, str):
         content = str(content)
@@ -164,6 +166,7 @@ def build_text_from_chunk(chunk: Dict[str, Any]) -> str:
     if title and isinstance(title, str):
         return f"{title}\n\n{content}"
     return content
+
 
 def collect_chunks(
     normalized_root: str,
@@ -331,7 +334,7 @@ def collect_chunks(
                                     num_files,
                                     num_chunks,
                                 )
-                    return texts, metas, chunk_ids
+                                return texts, metas, chunk_ids
 
             except Exception as exc:
                 logger.warning("Konnte JSONL-Datei nicht lesen (%s): %s", fpath, exc)
@@ -350,9 +353,6 @@ def build_faiss_index(
     use_inner_product: bool,
     logger: logging.Logger,
 ) -> faiss.Index:
-    """
-    Erstellt einen FAISS-Index vom Typ IndexFlatIP oder IndexFlatL2.
-    """
     if embeddings.ndim != 2:
         raise ValueError(f"Embeddings müssen 2D sein, erhalten: %s", embeddings.shape)
 
@@ -374,11 +374,6 @@ def build_faiss_index(
 
 
 def save_meta_lines(meta_path: str, metas: List[Dict[str, Any]], logger: logging.Logger) -> None:
-    """
-    Speichert die Metadaten zu jedem Vektor als JSON-Lines-Datei.
-
-    Jede Zeile entspricht einem Vektor im Index (gleiche Reihenfolge!).
-    """
     os.makedirs(os.path.dirname(meta_path), exist_ok=True)
     with open(meta_path, "w", encoding="utf-8") as f:
         for idx, meta in enumerate(metas):
@@ -400,9 +395,6 @@ def save_index_config(
     use_inner_product: bool,
     logger: logging.Logger,
 ) -> None:
-    """
-    Speichert eine JSON-Konfigurationsdatei für den Index mit Modell- und Indexparametern.
-    """
     num_vecs, dim = embeddings.shape
 
     cfg: Dict[str, Any] = {
@@ -484,7 +476,6 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help="Dateiname für die Index-Konfiguration unter indices/faiss/.",
     )
     return parser.parse_args(argv)
-
 
 
 def main(argv: List[str] | None = None) -> int:
