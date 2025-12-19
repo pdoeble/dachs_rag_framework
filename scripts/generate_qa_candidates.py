@@ -537,12 +537,18 @@ def call_llm_ollama_once(
     top_p: float,
     max_tokens: int,
     timeout_s: int,
+    num_ctx: int = 0,          # <-- NEU
 ) -> List[Dict[str, Any]]:
-    """
-    Calls Ollama via the native /api/chat endpoint (Ollama 0.12.x on DACHS).
-    Expects a JSON array in the assistant's message content.
-    """
+
     url = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/chat")
+
+    options = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "num_predict": int(max_tokens),
+    }
+    if int(num_ctx) > 0:
+        options["num_ctx"] = int(num_ctx)   # <-- NEU: Kontextfenster wirklich setzen
 
     payload = {
         "model": model,
@@ -551,11 +557,7 @@ def call_llm_ollama_once(
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "options": {
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "num_predict": int(max_tokens),
-        },
+        "options": options,
     }
 
     resp = requests.post(url, json=payload, timeout=timeout_s)
@@ -597,6 +599,7 @@ def call_llm_ollama_with_retries(
     timeout_s: int,
     max_retries: int,
     retry_backoff_s: float,
+    num_ctx: int = 0,   
 ) -> List[Dict[str, Any]]:
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
@@ -609,6 +612,7 @@ def call_llm_ollama_with_retries(
                 top_p=top_p,
                 max_tokens=max_tokens,
                 timeout_s=timeout_s,
+                num_ctx=num_ctx,
             )
         except Exception as e:
             last_err = e
@@ -793,6 +797,7 @@ def process_semantic_file(
     temperature = float(llm_cfg.get("temperature", 0.2))
     top_p = float(llm_cfg.get("top_p", 0.9))
     max_tokens = int(llm_cfg.get("max_tokens", 1024))
+    num_ctx = int(llm_cfg.get("num_ctx", 8192))
     timeout_s = int(llm_cfg.get("request_timeout_s", 600))
     max_retries = int(llm_cfg.get("max_retries", 3))
     retry_backoff_s = float(llm_cfg.get("retry_backoff_s", 5.0))
@@ -973,7 +978,7 @@ def process_semantic_file(
             evidence_set = set(evidence)
             evidence_refs = [r for r in context_refs if r.get("chunk_id") in evidence_set]
 
-            runtime_cfg = cfg.get("runtime", {})
+            runtime_cfg = cfg.get("runtime", {}) if isinstance(cfg, dict) else (getattr(cfg, "runtime", {}) or {})
             if runtime_cfg.get("grounding_drop_if_meta_leak", False):
                 if _contains_meta_leak(question) or _contains_meta_leak(answer):
                     continue
