@@ -1,6 +1,6 @@
 {
-  "version": "0.3.0",
-  "description": "Config for generate_qa_candidates: stricter grounding + robust defaults for partially-missing semantic tags.",
+  "version": "0.4.0",
+  "description": "Config for generate_qa_candidates: deeper exam-style QA + strict grounding + adaptive per-document limits + traceability.",
 
   "paths": {
     "paths_file": "config/paths/paths.json",
@@ -17,13 +17,13 @@
 
     "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"],
 
-    "min_content_chars": 200
+    "min_content_chars": 150
   },
 
   "neighbors": {
-    "top_k_faiss": 24,
+    "top_k_faiss": 28,
     "similarity_threshold": 0.25,
-    "max_neighbors": 8,
+    "max_neighbors": 10,
 
     "max_local_neighbors_before": 1,
     "max_local_neighbors_after": 1,
@@ -34,21 +34,23 @@
 
   "grouping": {
     "min_group_size": 2,
-    "max_group_size": 6,
+    "max_group_size": 7,
 
-    "max_chars_per_chunk": 1200,
-    "max_total_context_chars": 12000
+    "max_chars_per_chunk": 1400,
+    "max_total_context_chars": 14000
   },
 
   "sampling": {
-    "max_qa_per_group": 2,
+    "max_qa_per_group": 3,
     "max_groups_per_chunk": 1,
 
-    "doc_budget_mode": "sqrt",
-    "min_qa_per_document": 5,
-    "max_qa_per_document": 250,
-    "qas_per_100_chunks": 2.0,
-    "sqrt_scale": 2.0,
+    "max_qa_per_document": {
+      "mode": "adaptive",
+      "min": 10,
+      "max": 220,
+      "per_100_chunks": 6.0,
+      "per_100k_chars": 1.0
+    },
 
     "global_qa_limit": 20000,
     "sampling_strategy": "sequential"
@@ -59,7 +61,7 @@
     "model": "qwen2.5:32b-instruct-q4_K_M",
     "temperature": 0.0,
     "top_p": 0.9,
-    "max_tokens": 900,
+    "max_tokens": 1100,
 
     "request_timeout_s": 300,
     "max_retries": 3,
