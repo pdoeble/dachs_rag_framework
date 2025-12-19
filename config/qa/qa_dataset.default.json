@@ -1,43 +1,59 @@
 {
-  "version": "0.1.0",
-  "description": "Config for generate_qa_dataset: Merge, Filter, Dedup, Versionierung. Pfade kommen aus config/paths/paths.json.",
-
+  "version": "0.2.0",
+  "description": "Config for generate_qa_dataset: Merge, Filter, Dedup, Versionierung. Parallelisierbar via map/reduce. Pfade kommen aus config/paths/paths.json.",
   "paths": {
     "paths_file": "config/paths/paths.json"
   },
-
   "input": {
     "file_glob": "*.jsonl"
   },
-
   "mapping": {
     "instruction_from": "question",
     "input_value": "",
     "output_from": "answer"
   },
-
   "filters": {
-    "require_fields": ["question", "answer"],
+    "require_fields": [
+      "question",
+      "answer"
+    ],
     "require_nonempty_sources": true,
-
     "min_question_chars": 20,
     "max_question_chars": 600,
     "min_answer_chars": 30,
     "max_answer_chars": 2000,
-
-    "languages_allowed": ["de", "en"],
-    "trust_levels_allowed": ["high", "medium"],
-    "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"],
-
+    "languages_allowed": [
+      "de",
+      "en"
+    ],
+    "trust_levels_allowed": [
+      "high",
+      "medium"
+    ],
+    "content_types_allowed": [
+      "textbook",
+      "handbook",
+      "paper",
+      "simulation_report",
+      "api_doc",
+      "software_manual"
+    ],
     "drop_if_language_mismatch": false
   },
-
   "dedup": {
     "mode": "exact",
-    "keys": ["question", "answer"],
-    "keep": "first"
+    "keys": [
+      "instruction",
+      "output"
+    ],
+    "keep": "first",
+    "store": "hash16"
   },
-
+  "id": {
+    "workspace_abbr": "ws",
+    "strategy": "sequential",
+    "zero_pad": 5
+  },
   "output": {
     "dataset_name": "qa_final",
     "qa_schema_version": "v1",
@@ -46,14 +62,18 @@
     "write_changelog": true,
     "changelog_filename": "CHANGELOG.md"
   },
-
   "runtime": {
     "resume_mode": "overwrite",
     "dry_run": false,
-    "log_level": "INFO",
     "log_every_n": 2000
   },
-
+  "parallel": {
+    "mode": "single",
+    "num_shards": 16,
+    "shard_id": 0,
+    "intermediate_subdir": "_tmp_shards",
+    "shard_key": "anchor_or_candidate"
+  },
   "debug": {
     "limit_num_files": 0,
     "limit_num_examples": 0,

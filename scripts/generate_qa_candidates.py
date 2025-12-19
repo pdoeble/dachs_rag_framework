@@ -26,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
 import requests
 
@@ -132,6 +132,43 @@ def sha1_json(obj: Any) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return sha1_text(s)
 
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def make_candidate_id(anchor_chunk_id: str, question: str, answer: str) -> str:
+    # stabil + deterministic
+    h = hashlib.sha1((question.strip() + "\n" + answer.strip()).encode("utf-8")).hexdigest()[:16]
+    return f"{anchor_chunk_id}:{h}"
+
+def _as_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if x is not None]
+    return [str(v)]
+
+def make_source_ref(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    meta = chunk.get("meta") if isinstance(chunk.get("meta"), dict) else {}
+    return {
+        "chunk_id": chunk.get("chunk_id"),
+        "doc_id": chunk.get("doc_id"),
+        "source_path": chunk.get("source_path"),
+        "title": chunk.get("title"),
+        "page_start": _as_int(meta.get("page_start")),
+        "page_end": _as_int(meta.get("page_end")),
+    }
+
+def normalize_chunk_id_list(x: Any) -> List[str]:
+    if not isinstance(x, list):
+        return []
+    out: List[str] = []
+    for v in x:
+        if isinstance(v, str) and v.strip():
+            out.append(v.strip())
+    return out
 
 def iter_semantic_files(semantic_dir: Path, limit_num_files: int = 0) -> Iterable[Path]:
     files = sorted(p for p in semantic_dir.glob("*.jsonl") if p.is_file()) + sorted(
@@ -612,69 +649,69 @@ def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
         if p.exists():
             user_template = load_text(p)
 
-if system_prompt is None:
-    system_prompt = (
-        "You are a dataset generator for engineering, thermodynamics, and numerical simulation.\n"
-        "Your task is to generate exam-style practice question–answer pairs that are fully grounded in provided technical content.\n\n"
-        "Non-negotiable rules:\n"
-        "- Use ONLY information explicitly stated in the given context chunks. Do NOT incorporate outside knowledge or assumptions.\n"
-        "- Do NOT invent any formulas, symbols, values, units, definitions, mechanisms, pros/cons, or steps that are not in the text.\n"
-        "- Do NOT generalize beyond the text (no unsupported \"typically\", \"usually\", or guesses) unless the context explicitly indicates uncertainty.\n"
-        "- Every question and answer must be **self-contained and meaningful**: do not require the reader to refer to the chunks or external sources. However, they must remain fully supported by the chunks.\n"
-        "- Maintain the exact wording, symbols, and notation given in the context (including Greek letters, subscripts, units) for consistency and accuracy.\n"
-        "- Use the same language as the context (German vs. English). If the context is mixed or unclear, default to the dominant language in the chunks.\n"
-        "- Absolutely do NOT reveal or mention any chunk IDs, document titles, file names, FAISS indexes, or any metadata in the questions or answers.\n\n"
-        "Grounding check (must pass for every Q/A):\n"
-        "- **Each sentence in the answer must be directly supported by an explicit statement in the context.** If a sentence would require any outside knowledge or inference not in the text, remove that sentence.\n"
-        "- If removing unsupported content leaves the answer incomplete or empty, then do NOT generate that Q/A pair (i.e., such a case should result in no question at all). The output in that case would be an empty JSON array `[]`.\n"
-    )
+    if system_prompt is None:
+        system_prompt = (
+            "You are a dataset generator for engineering, thermodynamics, and numerical simulation.\n"
+            "Your task is to generate exam-style practice question–answer pairs that are fully grounded in provided technical content.\n\n"
+            "Non-negotiable rules:\n"
+            "- Use ONLY information explicitly stated in the given context chunks. Do NOT incorporate outside knowledge or assumptions.\n"
+            "- Do NOT invent any formulas, symbols, values, units, definitions, mechanisms, pros/cons, or steps that are not in the text.\n"
+            "- Do NOT generalize beyond the text (no unsupported \"typically\", \"usually\", or guesses) unless the context explicitly indicates uncertainty.\n"
+            "- Every question and answer must be **self-contained and meaningful**: do not require the reader to refer to the chunks or external sources. However, they must remain fully supported by the chunks.\n"
+            "- Maintain the exact wording, symbols, and notation given in the context (including Greek letters, subscripts, units) for consistency and accuracy.\n"
+            "- Use the same language as the context (German vs. English). If the context is mixed or unclear, default to the dominant language in the chunks.\n"
+            "- Absolutely do NOT reveal or mention any chunk IDs, document titles, file names, FAISS indexes, or any metadata in the questions or answers.\n\n"
+            "Grounding check (must pass for every Q/A):\n"
+            "- **Each sentence in the answer must be directly supported by an explicit statement in the context.** If a sentence would require any outside knowledge or inference not in the text, remove that sentence.\n"
+            "- If removing unsupported content leaves the answer incomplete or empty, then do NOT generate that Q/A pair (i.e., such a case should result in no question at all). The output in that case would be an empty JSON array `[]`.\n"
+        )
 
-if user_template is None:
-    user_template = (
-        "You are given several context chunks from technical documents, labeled for your reference (e.g., with chunk identifiers). These are *not* to be mentioned verbatim in your output.\n"
-        "Use **only** the information in these chunks to create question–answer pairs.\n\n"
-        "{CONTEXT}\n\n"
-        "Task:\n"
-        "- Generate between 1 and {MAX_QA_PER_GROUP} high-quality, non-trivial question–answer pairs based on the above context. Aim for questions that test understanding of important points in the text.\n"
-        "- Each Q/A pair must be fully and explicitly supported by the given chunks. If you cannot find enough support for at least one question, output an empty JSON array `[]`.\n"
-        "- **Focus on asking about:** (1) stated conditions, assumptions, or validity limits; (2) relationships between quantities or variables (including directions of effect, if described); (3) the meaning or definition of symbols/terms explicitly defined; (4) comparisons or distinctions that the text explicitly makes. These tend to produce insightful questions.\n"
-        "- You may combine information from multiple chunks for one question **if** they are clearly related, in order to create a more integrative question. (For example, connect a formula in one chunk with conditions from another.) Ensure all parts of the answer appear in the context.\n"
-        "- Avoid questions that are too vague or generic (stick to the specifics of the text). Avoid trivial fact recall that doesn’t deepen understanding. Also avoid near-duplicate questions covering the same idea.\n"
-        "- Do not split one concept into redundant questions. It’s better to ask one comprehensive question than several repetitive ones.\n\n"
-        "Length and style:\n"
-        "- **Question:** Ideally 1 sentence (or 2 at most, if needed for clarity). It should be concise but specific about what it’s asking.\n"
-        "- **Answer:** Provide as many sentences as needed (up to ~4) to fully answer, *in your own words based on the text*. Use complete sentences. If the answer is a list of points explicitly in the text, you can format it in sentences or as a list. Ensure the answer is thorough yet still succinct – include all relevant details from the context, but nothing more.\n"
-        "- If the context only supports a very short answer (e.g. a single term or value), phrase it as a complete sentence. Avoid one-word answers.\n"
-        "- Use an academic tone suitable for explanations. However, do not add extraneous commentary – just state the answer factually as supported by the text.\n\n"
-        "Difficulty labeling:\n"
-        "- For each Q/A, assign a difficulty level: **\"basic\"**, **\"intermediate\"**, or **\"advanced\"**.\n"
-        "- Use **basic** for straightforward questions that involve direct recall or a single-step inference explicitly shown in the text.\n"
-        "- Use **intermediate** for questions that require combining two or more pieces of information from the text or understanding a condition in context.\n"
-        "- Use **advanced** for questions involving subtle nuances, multiple conditions/constraints, or interpretations that are explicitly supported but not immediately obvious. These may require careful reading of the text (though still no outside knowledge).\n\n"
-        "Output format (STRICT):\n"
-        "- Return **ONLY** a JSON array of the Q/A pairs (no prose or explanations outside the JSON).\n"
-        "- Each element of the array **must** be a JSON object with exactly these keys:\n"
-        "  - \"question\": string   (the question text)\n"
-        "  - \"answer\": string     (the answer text fully answering the question, grounded in the context)\n"
-        "  - \"difficulty\": \"basic\" | \"intermediate\" | \"advanced\"\n"
-        "  - \"source_chunks\": list of chunk identifiers used for the answer (for traceability, e.g. [\"chunk1\", \"chunk3\"]) \n"
-        "- Example of final output structure (two sample items):\n"
-        "  [\n"
-        "    {\n"
-        "      \"question\": \"...\",\n"
-        "      \"answer\": \"...\",\n"
-        "      \"difficulty\": \"basic\",\n"
-        "      \"source_chunks\": [\"...\"]\n"
-        "    },\n"
-        "    {\n"
-        "      \"question\": \"...\",\n"
-        "      \"answer\": \"...\",\n"
-        "      \"difficulty\": \"advanced\",\n"
-        "      \"source_chunks\": [\"...\", \"...\"]\n"
-        "    }\n"
-        "  ]\n"
-        " (Do not include this example in the output; it is just to illustrate the format and quoting.)\n"
-    )
+    if user_template is None:
+        user_template = (
+            "You are given several context chunks from technical documents, labeled for your reference (e.g., with chunk identifiers). These are *not* to be mentioned verbatim in your output.\n"
+            "Use **only** the information in these chunks to create question–answer pairs.\n\n"
+            "{CONTEXT}\n\n"
+            "Task:\n"
+            "- Generate between 1 and {MAX_QA_PER_GROUP} high-quality, non-trivial question–answer pairs based on the above context. Aim for questions that test understanding of important points in the text.\n"
+            "- Each Q/A pair must be fully and explicitly supported by the given chunks. If you cannot find enough support for at least one question, output an empty JSON array `[]`.\n"
+            "- **Focus on asking about:** (1) stated conditions, assumptions, or validity limits; (2) relationships between quantities or variables (including directions of effect, if described); (3) the meaning or definition of symbols/terms explicitly defined; (4) comparisons or distinctions that the text explicitly makes. These tend to produce insightful questions.\n"
+            "- You may combine information from multiple chunks for one question **if** they are clearly related, in order to create a more integrative question. (For example, connect a formula in one chunk with conditions from another.) Ensure all parts of the answer appear in the context.\n"
+            "- Avoid questions that are too vague or generic (stick to the specifics of the text). Avoid trivial fact recall that doesn’t deepen understanding. Also avoid near-duplicate questions covering the same idea.\n"
+            "- Do not split one concept into redundant questions. It’s better to ask one comprehensive question than several repetitive ones.\n\n"
+            "Length and style:\n"
+            "- **Question:** Ideally 1 sentence (or 2 at most, if needed for clarity). It should be concise but specific about what it’s asking.\n"
+            "- **Answer:** Provide as many sentences as needed (up to ~4) to fully answer, *in your own words based on the text*. Use complete sentences. If the answer is a list of points explicitly in the text, you can format it in sentences or as a list. Ensure the answer is thorough yet still succinct – include all relevant details from the context, but nothing more.\n"
+            "- If the context only supports a very short answer (e.g. a single term or value), phrase it as a complete sentence. Avoid one-word answers.\n"
+            "- Use an academic tone suitable for explanations. However, do not add extraneous commentary – just state the answer factually as supported by the text.\n\n"
+            "Difficulty labeling:\n"
+            "- For each Q/A, assign a difficulty level: **\"basic\"**, **\"intermediate\"**, or **\"advanced\"**.\n"
+            "- Use **basic** for straightforward questions that involve direct recall or a single-step inference explicitly shown in the text.\n"
+            "- Use **intermediate** for questions that require combining two or more pieces of information from the text or understanding a condition in context.\n"
+            "- Use **advanced** for questions involving subtle nuances, multiple conditions/constraints, or interpretations that are explicitly supported but not immediately obvious. These may require careful reading of the text (though still no outside knowledge).\n\n"
+            "Output format (STRICT):\n"
+            "- Return **ONLY** a JSON array of the Q/A pairs (no prose or explanations outside the JSON).\n"
+            "- Each element of the array **must** be a JSON object with exactly these keys:\n"
+            "  - \"question\": string   (the question text)\n"
+            "  - \"answer\": string     (the answer text fully answering the question, grounded in the context)\n"
+            "  - \"difficulty\": \"basic\" | \"intermediate\" | \"advanced\"\n"
+            "  - \"source_chunks\": list of chunk identifiers used for the answer (for traceability, e.g. [\"chunk1\", \"chunk3\"]) \n"
+            "- Example of final output structure (two sample items):\n"
+            "  [\n"
+            "    {\n"
+            "      \"question\": \"...\",\n"
+            "      \"answer\": \"...\",\n"
+            "      \"difficulty\": \"basic\",\n"
+            "      \"source_chunks\": [\"...\"]\n"
+            "    },\n"
+            "    {\n"
+            "      \"question\": \"...\",\n"
+            "      \"answer\": \"...\",\n"
+            "      \"difficulty\": \"advanced\",\n"
+            "      \"source_chunks\": [\"...\", \"...\"]\n"
+            "    }\n"
+            "  ]\n"
+            " (Do not include this example in the output; it is just to illustrate the format and quoting.)\n"
+        )
 
 
     return system_prompt, user_template
@@ -868,32 +905,42 @@ def process_semantic_file(
             if difficulty not in ("basic", "intermediate", "advanced"):
                 continue
 
-            all_chunk_ids = [c["chunk_id"] for c in context_group if "chunk_id" in c]
-            all_doc_ids = [c.get("doc_id") for c in context_group if c.get("doc_id")]
+            all_chunk_ids: List[str] = [c.get("chunk_id") for c in context_group if isinstance(c.get("chunk_id"), str)]
+            allowed: Set[str] = set(all_chunk_ids)
 
-            language = chunk.get("language")
-            trust_level = get_semantic_field(chunk, "trust_level")
-            content_types = get_flat_list_field(chunk, "content_type")
-            domains = get_flat_list_field(chunk, "domain")
+            raw_evidence = qa.get("evidence_chunks")
+            evidence = normalize_chunk_id_list(raw_evidence)
+            evidence = [cid for cid in evidence if cid in allowed]
+            if not evidence:
+                evidence = [chunk_id]  # anchor as hard fallback
 
-            qa_hash = hashlib.sha1(
-                (chunk_id + "\n" + question.strip() + "\n" + answer.strip()).encode("utf-8")
-            ).hexdigest()[:16]
+            # refs
+            context_refs = [make_source_ref(c) for c in context_group]
+            evidence_set = set(evidence)
+            evidence_refs = [r for r in context_refs if r.get("chunk_id") in evidence_set]
 
             out_record = {
-                "id": f"{chunk_id}:{qa_hash}",
+                "id": make_candidate_id(anchor_chunk_id=chunk_id, qa_index=written_for_chunk),
                 "anchor_chunk_id": chunk_id,
-                "anchor_doc_id": chunk.get("doc_id"),
-                "source_chunks": all_chunk_ids,
-                "doc_ids": all_doc_ids,
-                "question": question.strip(),
-                "answer": answer.strip(),
-                "difficulty": difficulty,
+                "anchor_doc_id": doc_id,
+
+                "context_chunks": all_chunk_ids,
+                "source_chunks": evidence,              # <-- downstream uses this for source_ids
+                "source_refs": evidence_refs,           # fast “where is it in the PDF”
+                "context_refs": context_refs,           # optional but useful for audit/debug
+
+                "doc_ids": list(dict.fromkeys([c.get("doc_id") for c in context_group if isinstance(c.get("doc_id"), str)])),
+
+                "question": qa.get("question", ""),
+                "answer": qa.get("answer", ""),
+                "difficulty": qa.get("difficulty", ""),
+
                 "language": language,
                 "content_type": content_types,
                 "domain": domains,
                 "trust_level": trust_level,
                 "workspace_file": in_path.name,
+
                 "provenance": {
                     "faiss": {
                         "metric": metric_info.metric,
