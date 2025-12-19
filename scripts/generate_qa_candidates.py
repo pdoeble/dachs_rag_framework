@@ -187,10 +187,6 @@ def _as_int(x: Any) -> Optional[int]:
     except Exception:
         return None
 
-def make_candidate_id(anchor_chunk_id: str, question: str, answer: str) -> str:
-    # stabil + deterministic
-    h = hashlib.sha1((question.strip() + "\n" + answer.strip()).encode("utf-8")).hexdigest()[:16]
-    return f"{anchor_chunk_id}:{h}"
 
 def _as_list(v: Any) -> List[str]:
     if v is None:
