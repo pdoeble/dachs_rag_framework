@@ -43,7 +43,12 @@
   "sampling": {
     "max_qa_per_group": 2,
     "max_groups_per_chunk": 1,
-    "max_qa_per_document": 50,
+
+    "doc_budget_mode": "sqrt",
+    "min_qa_per_document": 5,
+    "max_qa_per_document": 250,
+    "qas_per_100_chunks": 2.0,
+    "sqrt_scale": 2.0,
 
     "global_qa_limit": 20000,
     "sampling_strategy": "sequential"

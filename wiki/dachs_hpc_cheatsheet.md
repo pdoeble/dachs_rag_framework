@@ -28,7 +28,10 @@ Nützliche Optionen:
 
 ```bash
 squeue -u $USER -o "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"
+squeue -o %u,%a,%A,%Q
 squeue -j <jobid>            # nur einen bestimmten Job
+squeue --start -j JOBID      # Einschätzen, wann der Job startet erlaubt dann:
+squeue -h -o %S
 ```
 
 ### Detailinfos zu einem Job
