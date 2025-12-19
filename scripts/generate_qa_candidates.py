@@ -793,7 +793,7 @@ def process_semantic_file(
     temperature = float(llm_cfg.get("temperature", 0.2))
     top_p = float(llm_cfg.get("top_p", 0.9))
     max_tokens = int(llm_cfg.get("max_tokens", 1024))
-    timeout_s = int(llm_cfg.get("request_timeout_s", 60))
+    timeout_s = int(llm_cfg.get("request_timeout_s", 600))
     max_retries = int(llm_cfg.get("max_retries", 3))
     retry_backoff_s = float(llm_cfg.get("retry_backoff_s", 5.0))
 
