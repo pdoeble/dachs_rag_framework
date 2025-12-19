@@ -1,6 +1,6 @@
 {
-  "version": "0.4.0",
-  "description": "Config for generate_qa_candidates: deeper exam-style QA + strict grounding + adaptive per-document limits + traceability.",
+  "version": "0.4.1",
+  "description": "Config for generate_qa_candidates: higher yield (more eligible chunks, looser grouping, higher per-doc caps) while keeping grounding and traceability.",
 
   "paths": {
     "paths_file": "config/paths/paths.json",
@@ -9,21 +9,21 @@
   },
 
   "filters": {
-    "languages_allowed": ["de", "en"],
-    "trust_levels_allowed": ["high", "medium"],
+    "languages_allowed": ["de", "en", "unknown"],
+    "trust_levels_allowed": ["high", "medium", "low"],
 
     "chunk_roles_allowed": ["definition", "explanation", "example", "key_result", "exercise"],
     "allow_missing_chunk_role": true,
 
     "content_types_allowed": ["textbook", "handbook", "paper", "simulation_report", "api_doc", "software_manual"],
 
-    "min_content_chars": 150
+    "min_content_chars": 180
   },
 
   "neighbors": {
-    "top_k_faiss": 28,
-    "similarity_threshold": 0.25,
-    "max_neighbors": 10,
+    "top_k_faiss": 40,
+    "similarity_threshold": 0.0,
+    "max_neighbors": 15,
 
     "max_local_neighbors_before": 1,
     "max_local_neighbors_after": 1,
@@ -33,23 +33,23 @@
   },
 
   "grouping": {
-    "min_group_size": 2,
-    "max_group_size": 7,
+    "min_group_size": 1,
+    "max_group_size": 8,
 
     "max_chars_per_chunk": 1400,
     "max_total_context_chars": 14000
   },
 
   "sampling": {
-    "max_qa_per_group": 3,
-    "max_groups_per_chunk": 1,
+    "max_qa_per_group": 5,
+    "max_groups_per_chunk": 2,
 
     "max_qa_per_document": {
       "mode": "adaptive",
-      "min": 10,
-      "max": 220,
-      "per_100_chunks": 6.0,
-      "per_100k_chars": 1.0
+      "min": 20,
+      "max": 1000,
+      "per_100_chunks": 40.0,
+      "per_100k_chars": 4.0
     },
 
     "global_qa_limit": 20000,
@@ -78,8 +78,8 @@
     "log_every_n_examples": 50,
 
     "grounding_enabled": true,
-    "grounding_min_coverage_question": 0.55,
-    "grounding_min_coverage_answer": 0.45,
+    "grounding_min_coverage_question": 0.45,
+    "grounding_min_coverage_answer": 0.35,
     "grounding_drop_if_meta_leak": true
   },
 
