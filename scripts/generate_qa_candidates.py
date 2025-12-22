@@ -26,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set, Iterator
 
 import requests
 
@@ -58,14 +58,6 @@ except Exception as e:  # pragma: no cover
 
 logger = logging.getLogger("generate_qa_candidates")
 
-def setup_logging(level_name: str) -> None:
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logger.setLevel(level)
 
 @dataclass
 class QAConfig:
@@ -108,6 +100,82 @@ class QAConfig:
     def debug(self) -> Dict[str, Any]:
         return self.raw.get("debug", {})
 
+
+@dataclass(frozen=True)
+
+class PromptBundle:
+    plan_system: str
+    plan_user: str
+    gen_system: str
+    gen_user: str
+
+def render_prompt(
+    *,
+    context_group: Sequence[Dict[str, Any]],
+    template: str,
+    cfg: QAConfig,
+    max_qa_per_group: Optional[int] = None,
+    plan_json: Optional[str] = None,
+) -> str:
+    max_chars_per_chunk = int(cfg.grouping.get("max_chars_per_chunk", 1200))
+    max_total_chars = int(cfg.grouping.get("max_total_context_chars", 0))
+
+    context_text = build_context_text_for_prompt(
+        context_group=context_group,
+        max_chars_per_chunk=max_chars_per_chunk,
+        max_total_chars=max_total_chars,
+    )
+
+    prompt = template.replace("{CONTEXT}", context_text)
+
+    # Optional placeholders (only replace if provided)
+    if max_qa_per_group is not None:
+        prompt = prompt.replace("{MAX_QA_PER_GROUP}", str(int(max_qa_per_group)))
+    if plan_json is not None:
+        prompt = prompt.replace("{PLAN_JSON}", plan_json)
+
+    return prompt
+
+
+def parse_plan_output(plan_arr: Any) -> Optional[Dict[str, Any]]:
+    """
+    Expect: JSON array with exactly 1 object:
+    {
+      "takeaways": [ { "takeaway": str, "evidence_chunks": [str,...] }, { ... } ],
+      "equations_present": bool,
+      "equation_quotes": [str, ...],
+      "generator_checks": [str, ...]
+    }
+    Return dict if valid else None.
+    """
+    if not isinstance(plan_arr, list) or len(plan_arr) != 1:
+        return None
+    obj = plan_arr[0]
+    if not isinstance(obj, dict):
+        return None
+
+    takeaways = obj.get("takeaways")
+    if not isinstance(takeaways, list) or len(takeaways) != 2:
+        return None
+    for t in takeaways:
+        if not isinstance(t, dict):
+            return None
+        if not isinstance(t.get("takeaway"), str) or not t["takeaway"].strip():
+            return None
+        ev = t.get("evidence_chunks")
+        if not isinstance(ev, list) or not ev or not all(isinstance(x, str) and x.strip() for x in ev):
+            return None
+
+    if not isinstance(obj.get("equations_present"), bool):
+        return None
+    eq = obj.get("equation_quotes")
+    if not isinstance(eq, list) or not all(isinstance(x, str) for x in eq):
+        return None
+    gc = obj.get("generator_checks")
+    if not isinstance(gc, list) or not all(isinstance(x, str) for x in gc):
+        return None
+
+    return obj
 
 @dataclass(frozen=True)
 class FaissMetricInfo:
@@ -187,13 +255,15 @@ def _as_int(x: Any) -> Optional[int]:
     except Exception:
         return None
 
+def _json_preview(x: object, max_len: int = 900) -> str:
+    try:
+        s = json.dumps(x, ensure_ascii=False)
+    except Exception:
+        s = repr(x)
+    if len(s) > max_len:
+        return s[:max_len] + "…"
+    return s
 
-def _as_list(v: Any) -> List[str]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        return [str(x) for x in v if x is not None]
-    return [str(v)]
 
 def make_source_ref(chunk: Dict[str, Any]) -> Dict[str, Any]:
     meta = chunk.get("meta") if isinstance(chunk.get("meta"), dict) else {}
@@ -214,15 +284,6 @@ def normalize_chunk_id_list(x: Any) -> List[str]:
         if isinstance(v, str) and v.strip():
             out.append(v.strip())
     return out
-
-def iter_semantic_files(semantic_dir: Path, limit_num_files: int = 0) -> Iterable[Path]:
-    files = sorted(p for p in semantic_dir.glob("*.jsonl") if p.is_file()) + sorted(
-        p for p in semantic_dir.glob("*.json") if p.is_file()
-    )
-    if limit_num_files > 0:
-        files = files[:limit_num_files]
-    return files
-
 
 def load_semantic_file(path: Path) -> List[Dict[str, Any]]:
     if path.suffix == ".jsonl":
@@ -457,58 +518,6 @@ def filter_faiss_neighbors(
 
     return filtered
 
-
-def build_context_group(
-    candidate: Dict[str, Any],
-    local_neighbors: Sequence[Dict[str, Any]],
-    faiss_neighbors: Sequence[Dict[str, Any]],
-    cfg: QAConfig,
-) -> List[Dict[str, Any]]:
-    grouping = cfg.grouping
-    min_group_size = int(grouping.get("min_group_size", 2))
-    max_group_size = int(grouping.get("max_group_size", 6))
-
-    ordered_chunks: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-
-    def add_chunk(ch: Dict[str, Any]) -> None:
-        cid = str(ch.get("chunk_id"))
-        if not cid or cid in seen_ids:
-            return
-        seen_ids.add(cid)
-
-        summary_short = get_semantic_field(ch, "summary_short")
-        if not isinstance(summary_short, str):
-            summary_short = None
-
-        ordered_chunks.append(
-            {
-                "chunk_id": cid,
-                "doc_id": ch.get("doc_id"),
-                "language": ch.get("language"),
-                "trust_level": get_semantic_field(ch, "trust_level"),
-                "content_type": get_flat_list_field(ch, "content_type"),
-                "domain": get_flat_list_field(ch, "domain"),
-                "summary_short": summary_short,
-                "content": ch.get("content"),
-            }
-        )
-
-    add_chunk(candidate)
-    for ch in local_neighbors:
-        add_chunk(ch)
-    for ch in faiss_neighbors:
-        add_chunk(ch)
-
-    if len(ordered_chunks) < min_group_size:
-        return []
-
-    if len(ordered_chunks) > max_group_size:
-        ordered_chunks = ordered_chunks[:max_group_size]
-
-    return ordered_chunks
-
-
 def extract_json_from_text(text: str) -> Any:
     text = text.strip()
     if text.startswith("["):
@@ -599,8 +608,13 @@ def call_llm_ollama_with_retries(
     timeout_s: int,
     max_retries: int,
     retry_backoff_s: float,
-    num_ctx: int = 0,   
+    num_ctx: int = 0,
 ) -> List[Dict[str, Any]]:
+    """
+    Unchanged. You reuse this for BOTH passes:
+      - Plan pass: call_llm_ollama_with_retries(prompts.plan_system, plan_user_prompt, ..., max_tokens=plan_max_tokens)
+      - Generate pass: call_llm_ollama_with_retries(prompts.gen_system, gen_user_prompt, ..., max_tokens=max_tokens)
+    """
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
@@ -659,114 +673,46 @@ def build_context_text_for_prompt(
 
     return "\n".join(lines)
 
+@dataclass(frozen=True)
+class PromptBundle:
+    plan_system: str
+    plan_user: str
+    gen_system: str
+    gen_user: str
 
-def render_user_prompt(
-    context_group: Sequence[Dict[str, Any]],
-    user_template: str,
-    max_qa_per_group: int,
-    cfg: QAConfig,
-) -> str:
-    max_chars_per_chunk = int(cfg.grouping.get("max_chars_per_chunk", 1200))
-    max_total_chars = int(cfg.grouping.get("max_total_context_chars", 0))
-    context_text = build_context_text_for_prompt(
-        context_group=context_group,
-        max_chars_per_chunk=max_chars_per_chunk,
-        max_total_chars=max_total_chars,
+def load_prompt_bundle(cfg: "QAConfig") -> PromptBundle:
+    """
+    Load double-pass prompts from config/qa/prompts.json (single source of truth).
+    """
+    prompts_path = REPO_ROOT / "config" / "qa" / "prompts.json"
+    data = load_json(prompts_path)
+
+    try:
+        plan = data["plan"]
+        gen = data["generate"]
+        plan_system = str(plan["system"])
+        plan_user = str(plan["user"])
+        gen_system = str(gen["system"])
+        gen_user = str(gen["user"])
+    except Exception as e:
+        raise KeyError(f"prompts.json invalid or missing keys: {e}")
+
+    # hard validation
+    for name, val in [
+        ("plan.system", plan_system),
+        ("plan.user", plan_user),
+        ("generate.system", gen_system),
+        ("generate.user", gen_user),
+    ]:
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(f"prompts.json: '{name}' must be a non-empty string")
+
+    return PromptBundle(
+        plan_system=plan_system,
+        plan_user=plan_user,
+        gen_system=gen_system,
+        gen_user=gen_user,
     )
-    prompt = user_template
-    prompt = prompt.replace("{CONTEXT}", context_text)
-    prompt = prompt.replace("{MAX_QA_PER_GROUP}", str(max_qa_per_group))
-    return prompt
-
-
-def load_or_default_prompts(cfg: QAConfig) -> Tuple[str, str]:
-    paths = cfg.paths
-
-    system_path = paths.get("prompt_system_file")
-    user_path = paths.get("prompt_user_template_file")
-
-    system_prompt: Optional[str] = None
-    user_template: Optional[str] = None
-
-    if system_path:
-        p = REPO_ROOT / system_path
-        if p.exists():
-            system_prompt = load_text(p)
-
-    if user_path:
-        p = REPO_ROOT / user_path
-        if p.exists():
-            user_template = load_text(p)
-
-    if system_prompt is None:
-        system_prompt = (
-            "You are generating a high-quality exam/practice QA dataset for engineering, thermodynamics, and numerical simulation.\n"
-            "Generate question–answer pairs STRICTLY and ONLY from the provided context chunks.\n\n"
-            "Non-negotiable grounding rules:\n"
-            "- Use ONLY information explicitly stated in the chunks. Do NOT add outside knowledge.\n"
-            "- Do NOT invent formulas, symbols, parameter values, assumptions, units, definitions, mechanisms, pros/cons, or steps.\n"
-            "- Do NOT generalize (no 'typically', 'usually', 'often', 'can', 'may') unless the chunks explicitly express that uncertainty.\n"
-            "- Keep wording, symbols, and notation EXACTLY as in the chunks (Greek letters, subscripts, units, equation formatting).\n"
-            "- Use the same main language as the context (German vs. English). If mixed/unclear, use the dominant language.\n"
-            "- NEVER refer to the document/passage ('in the text', 'here', 'above', 'this section', 'this article', etc.).\n"
-            "- NEVER mention chunk_id, doc_id, file paths, FAISS, or any metadata in the question or answer.\n\n"
-            "Depth requirement (exam style):\n"
-            "- Target the ESSENCE of the passage: assumptions/validity limits, meaning of terms, interpretation of equations, or stated cause-effect relations.\n"
-            "- If equations are present in the evidence chunks, the answer MUST quote at least one relevant equation verbatim (as written).\n"
-            "- Prefer questions that require combining 2+ explicit statements from the chunks (but still fully grounded).\n\n"
-            "Hard fail policy:\n"
-            "- If you cannot produce at least one self-contained, fully grounded QA pair from the chunks, output exactly: []\n\n"
-            "Grounding check (must pass):\n"
-            "- Every sentence in the answer must be supported by an explicit statement in the chunks.\n"
-            "- If any sentence would require outside knowledge or inferred background, remove it.\n"
-            "- If removal makes the answer incomplete, output [].\n"
-        )
-
-    if user_template is None:
-        user_template = (
-            "You are given context chunks from technical documents. Each chunk is labeled for you only.\n"
-            "You must NOT mention chunk labels/ids in the question or answer.\n\n"
-            "{CONTEXT}\n\n"
-            "Task:\n"
-            "- Generate BETWEEN 1 and {MAX_QA_PER_GROUP} high-quality, non-trivial exam-style question–answer pairs.\n"
-            "- Each pair MUST be fully grounded in the chunks.\n"
-            "- If you cannot produce at least one grounded pair, return exactly: []\n\n"
-            "How to choose good questions (do this internally before writing):\n"
-            "1) Identify 1–3 'exam-worthy' takeaways explicitly stated in the chunks (assumptions, limits, equation meaning, definitions, stated relationships).\n"
-            "2) For each takeaway, craft a question that targets understanding (not just copying).\n"
-            "3) Ensure the answer can be written using only explicit statements and equations from the evidence chunks.\n\n"
-            "What to ask (prioritize):\n"
-            "1) Conditions/assumptions/validity limits explicitly stated.\n"
-            "2) Interpretation of symbols/terms explicitly defined.\n"
-            "3) Meaning of an equation AND what each term represents (ONLY if stated).\n"
-            "4) Stated relationships between quantities (including direction/sign only if stated).\n"
-            "5) If a step-by-step method is explicitly listed, ask to reproduce/justify it (verbatim steps only).\n\n"
-            "Mandatory traceability field:\n"
-            "- For each QA pair, add \"evidence_chunks\": a list of the chunk labels you actually used to answer.\n"
-            "- \"evidence_chunks\" MUST be a subset of the provided chunk labels.\n"
-            "- Do NOT put any labels/ids into question/answer text.\n\n"
-            "Answer quality requirements:\n"
-            "- Answers must be explanatory enough to be useful as training data (not one-liners unless the chunks only support a one-liner).\n"
-            "- Typical target length: 4–10 sentences.\n"
-            "- If equations exist in your evidence, include the most relevant equation verbatim and explain its terms/conditions ONLY as stated.\n\n"
-            "Difficulty label:\n"
-            "- Set \"difficulty\" to one of: \"basic\", \"intermediate\", \"advanced\".\n"
-            "- basic: direct recall of an explicit statement/equation.\n"
-            "- intermediate: combines 2+ explicit facts/conditions from the chunks.\n"
-            "- advanced: subtle constraints/assumptions/limitations or multi-condition reasoning explicitly supported by the chunks.\n\n"
-            "Output format (STRICT):\n"
-            "- Return ONLY a JSON array. No surrounding text.\n"
-            "- Each element must be an object with exactly these keys:\n"
-            "  - \"question\": string\n"
-            "  - \"answer\": string\n"
-            "  - \"difficulty\": \"basic\" | \"intermediate\" | \"advanced\"\n"
-            "  - \"evidence_chunks\": array of strings\n"
-        )
-
-
-
-    return system_prompt, user_template
-
 
 def process_semantic_file(
     in_path: Path,
@@ -802,19 +748,32 @@ def process_semantic_file(
     max_retries = int(llm_cfg.get("max_retries", 3))
     retry_backoff_s = float(llm_cfg.get("retry_backoff_s", 5.0))
 
-    system_prompt, user_template = load_or_default_prompts(cfg)
-    system_prompt_hash = sha1_text(system_prompt)
-    user_template_hash = sha1_text(user_template)
+    # NEW: prompts.json bundle + hashes (double-pass)
+    prompts = load_prompt_bundle(cfg)
+    plan_system_hash = sha1_text(prompts.plan_system)
+    plan_user_hash = sha1_text(prompts.plan_user)
+    gen_system_hash = sha1_text(prompts.gen_system)
+    gen_user_hash = sha1_text(prompts.gen_user)
+
+    # legacy keys (keep downstream compatibility)
+    system_prompt_hash = gen_system_hash
+    user_template_hash = gen_user_hash
+
     config_hash = sha1_json(cfg.raw)
+
+    # NEW: plan tokens (small budget; overrideable)
+    plan_max_tokens = int(llm_cfg.get("plan_max_tokens", min(900, max_tokens)))
 
     chunks = load_semantic_file(in_path)
     if isinstance(max_qa_per_document_cfg, int) and max_qa_per_document_cfg <= 0:
         remaining_qa_for_document = None
     else:
-        doc_total_chars = sum(len((c.get("text") or "")) for c in chunks)
+        doc_total_chars = sum(len((c.get("content") or c.get("text") or "")) for c in chunks)
         max_qa_per_document = compute_max_qa_per_document(max_qa_per_document_cfg, len(chunks), doc_total_chars)
         remaining_qa_for_document = max_qa_per_document
-        logger.info(f"max_qa_per_document (computed): {max_qa_per_document} (chunks={len(chunks)}, chars={doc_total_chars})")
+        logger.info(
+            f"max_qa_per_document (computed): {max_qa_per_document} (chunks={len(chunks)}, chars={doc_total_chars})"
+        )
 
     if not chunks:
         logging.warning("Keine Chunks in %s gefunden, überspringe.", in_path)
@@ -885,191 +844,269 @@ def process_semantic_file(
             metric_info=metric_info,
         )
 
-        faiss_neighbor_ids = [
-            str(nb.get("chunk_id")) for nb in faiss_neighbors_filtered if nb.get("chunk_id")
-        ]
+        faiss_neighbor_ids = [str(nb.get("chunk_id")) for nb in faiss_neighbors_filtered if nb.get("chunk_id")]
         faiss_neighbor_scores = [float(nb.get("score") or 0.0) for nb in faiss_neighbors_filtered]
 
-        context_group = build_context_group(
+        context_groups = build_context_groups(
             candidate=chunk,
             local_neighbors=local_neighbors,
             faiss_neighbors=faiss_neighbors_filtered,
             cfg=cfg,
+            max_groups_per_chunk=max_groups_per_chunk,
         )
-
-        if not context_group:
+        if not context_groups:
             continue
 
-        num_groups_for_chunk = 0
+        written_any_for_chunk = 0
+        num_groups_for_chunk = 0  # attempted groups for this chunk
 
-        user_prompt = render_user_prompt(
-            context_group=context_group,
-            user_template=user_template,
-            max_qa_per_group=max_qa_per_group,
-            cfg=cfg,
-        )
+        for context_group in context_groups:
+            if remaining_qa_for_document is not None and remaining_qa_for_document <= 0:
+                break
 
-        if backend != "ollama":
-            raise ValueError(f"Nicht unterstützter LLM-Backend-Typ: {backend!r}")
-
-        if dry_run:
-            logging.info(
-                "[Dry-Run] Würde LLM für chunk_id=%s in %s aufrufen.",
-                chunk_id,
-                in_path.name,
-            )
-            continue
-
-        try:
-            qa_list = call_llm_ollama_with_retries(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=model,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                timeout_s=timeout_s,
-                max_retries=max_retries,
-                retry_backoff_s=retry_backoff_s,
-            )
-        except Exception as e:
-            logging.warning(
-                "LLM-Aufruf für chunk_id=%s in %s fehlgeschlagen: %s",
-                chunk_id,
-                in_path.name,
-                e,
-            )
-            continue
-
-        if not qa_list:
-            continue
-
-        written_for_chunk = 0
-        for qa_idx, qa_obj in enumerate(qa_list):
             remaining_global = global_state.get("remaining_global")
             if isinstance(remaining_global, int) and remaining_global <= 0:
                 break
 
-            if not isinstance(qa_obj, dict):
-                continue
-
-            question = qa_obj.get("question")
-            answer = qa_obj.get("answer")
-            difficulty = qa_obj.get("difficulty")
-
-            if not isinstance(question, str) or not question.strip():
-                continue
-            if not isinstance(answer, str) or not answer.strip():
-                continue
-            if difficulty not in ("basic", "intermediate", "advanced"):
-                continue
-
-            all_chunk_ids = [c.get("chunk_id") for c in context_group if isinstance(c.get("chunk_id"), str)]
-            allowed = set(all_chunk_ids)
-
-            raw_evidence = qa_obj.get("evidence_chunks") or qa_obj.get("source_chunks") or qa_obj.get("evidence") or []
-            evidence = normalize_chunk_id_list(raw_evidence)
-            evidence = [cid for cid in evidence if cid in allowed]
-            if not evidence:
-                evidence = list(all_chunk_ids)
-
-            # refs
-            context_refs = [make_source_ref(c) for c in context_group]
-            evidence_set = set(evidence)
-            evidence_refs = [r for r in context_refs if r.get("chunk_id") in evidence_set]
-
-            runtime_cfg = cfg.get("runtime", {}) if isinstance(cfg, dict) else (getattr(cfg, "runtime", {}) or {})
-            if runtime_cfg.get("grounding_drop_if_meta_leak", False):
-                if _contains_meta_leak(question) or _contains_meta_leak(answer):
-                    continue
-
-            anchor_doc_id = (
-                chunk.get("doc_id")
-                if isinstance(chunk.get("doc_id"), str) and chunk.get("doc_id")
-                else chunk_id.rsplit("_c", 1)[0]
-            )
-            language = (chunk.get("language") or get_semantic_field(chunk, "language") or "unknown")
-            content_types = get_flat_list_field(chunk, "content_type")
-            domains = get_flat_list_field(chunk, "domain")
-            trust_level = (chunk.get("trust_level") or get_semantic_field(chunk, "trust_level") or "missing")
-
-            out_record = {
-                "id": make_candidate_id(anchor_chunk_id=chunk_id, qa_index=qa_idx, payload=qa_obj),
-                "anchor_chunk_id": chunk_id,
-                "anchor_doc_id": anchor_doc_id,
-
-                "context_chunks": all_chunk_ids,
-                "source_chunks": evidence,
-                "source_refs": evidence_refs,
-                "context_refs": context_refs,
-
-                "doc_ids": list(dict.fromkeys([c.get("doc_id") for c in context_group if isinstance(c.get("doc_id"), str)])),
-
-                "question": question,
-                "answer": answer,
-                "difficulty": difficulty,
-
-                "language": language,
-                "content_type": content_types,
-                "domain": domains,
-                "trust_level": trust_level,
-                "workspace_file": in_path.name,
-
-                "provenance": {
-                    "faiss": {
-                        "metric": metric_info.metric,
-                        "index_type": metric_info.index_type,
-                        "normalized": metric_info.normalized,
-                        "neighbor_chunk_ids": faiss_neighbor_ids,
-                        "neighbor_scores": faiss_neighbor_scores,
-                    },
-                    "local_neighbor_chunk_ids": local_neighbor_ids,
-                    "config_hash": config_hash,
-                    "system_prompt_hash": system_prompt_hash,
-                    "user_template_hash": user_template_hash,
-                    "llm": {
-                        "backend": backend,
-                        "model": model,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "max_tokens": max_tokens,
-                    },
-                },
-            }
-
-
-            out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
-            written_for_chunk += 1
-            total_written += 1
-
-            if remaining_qa_for_document is not None:
-                remaining_qa_for_document -= 1
-                if remaining_qa_for_document <= 0:
-                    break
-
-            if isinstance(global_state.get("remaining_global"), int):
-                global_state["remaining_global"] -= 1
-                if global_state["remaining_global"] <= 0:
-                    break
-
-        if written_for_chunk > 0:
-            processed_set.add(chunk_id)
             num_groups_for_chunk += 1
             total_groups += 1
 
-        if total_written and (total_written % max(1, log_every) == 0):
-            logging.info(
-                "Zwischenstand %s: %d Q/A-Paare aus %d Gruppen.",
-                in_path.name,
-                total_written,
-                total_groups,
+            if backend != "ollama":
+                raise ValueError(f"Nicht unterstützter LLM-Backend-Typ: {backend!r}")
+
+            if dry_run:
+                logging.info(
+                    "[Dry-Run] Würde PLAN+GENERATE LLM für chunk_id=%s in %s aufrufen (group %d/%d).",
+                    chunk_id,
+                    in_path.name,
+                    num_groups_for_chunk,
+                    len(context_groups),
+                )
+                continue
+
+            # --------------------
+            # PASS 1: PLAN
+            # --------------------
+            plan_user_prompt = render_prompt(
+                context_group=context_group,
+                template=prompts.plan_user,
+                cfg=cfg,
             )
+
+            try:
+                plan_arr = call_llm_ollama_with_retries(
+                    system_prompt=prompts.plan_system,
+                    user_prompt=plan_user_prompt,
+                    model=model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=plan_max_tokens,
+                    timeout_s=timeout_s,
+                    max_retries=max_retries,
+                    retry_backoff_s=retry_backoff_s,
+                    num_ctx=num_ctx,
+                )
+            except Exception as e:
+                logging.warning(
+                    "LLM-PLAN-Aufruf für chunk_id=%s in %s fehlgeschlagen: %s",
+                    chunk_id,
+                    in_path.name,
+                    e,
+                )
+                continue
+
+            plan_obj = parse_plan_output(plan_arr)
+            if plan_obj is None:
+                logging.warning(
+                    "PLAN-Output ungültig ... für chunk_id=%s in %s -> FALLBACK: generate without plan",
+                    chunk_id,
+                    in_path.name,
+                )
+                plan_obj = {
+                    "takeaways": [],
+                    "equations_present": False,
+                    "equation_quotes": [],
+                    "generator_checks": [],
+                }
+                continue
+
+            plan_json_str = json.dumps(plan_obj, ensure_ascii=False, separators=(",", ":"))
+
+            # --------------------
+            # PASS 2: GENERATE
+            # --------------------
+            user_prompt = render_prompt(
+                context_group=context_group,
+                template=prompts.gen_user,
+                max_qa_per_group=max_qa_per_group,
+                plan_json=plan_json_str,
+                cfg=cfg,
+            )
+
+            try:
+                qa_list = call_llm_ollama_with_retries(
+                    system_prompt=prompts.gen_system,
+                    user_prompt=user_prompt,
+                    model=model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    timeout_s=timeout_s,
+                    max_retries=max_retries,
+                    retry_backoff_s=retry_backoff_s,
+                    num_ctx=num_ctx,
+                )
+            except Exception as e:
+                logging.warning(
+                    "LLM-GENERATE-Aufruf für chunk_id=%s in %s fehlgeschlagen: %s",
+                    chunk_id,
+                    in_path.name,
+                    e,
+                )
+                continue
+
+            if not qa_list:
+                continue
+
+            written_for_group = 0
+            for qa_idx, qa_obj in enumerate(qa_list):
+                remaining_global = global_state.get("remaining_global")
+                if isinstance(remaining_global, int) and remaining_global <= 0:
+                    break
+
+                if not isinstance(qa_obj, dict):
+                    continue
+
+                question = qa_obj.get("question")
+                answer = qa_obj.get("answer")
+                difficulty = qa_obj.get("difficulty")
+
+                if not isinstance(question, str) or not question.strip():
+                    continue
+                if not isinstance(answer, str) or not answer.strip():
+                    continue
+                if difficulty not in ("basic", "intermediate", "advanced"):
+                    continue
+
+                all_chunk_ids = [c.get("chunk_id") for c in context_group if isinstance(c.get("chunk_id"), str)]
+                allowed = set(all_chunk_ids)
+
+                raw_evidence = (
+                    qa_obj.get("evidence_chunks")
+                    or qa_obj.get("source_chunks")
+                    or qa_obj.get("evidence")
+                    or []
+                )
+                evidence = normalize_chunk_id_list(raw_evidence)
+                evidence = [cid for cid in evidence if cid in allowed]
+                if not evidence:
+                    evidence = list(all_chunk_ids)
+
+                context_refs = [make_source_ref(c) for c in context_group]
+                evidence_set = set(evidence)
+                evidence_refs = [r for r in context_refs if r.get("chunk_id") in evidence_set]
+
+                runtime_cfg = cfg.get("runtime", {}) if isinstance(cfg, dict) else (getattr(cfg, "runtime", {}) or {})
+                if runtime_cfg.get("grounding_drop_if_meta_leak", False):
+                    if _contains_meta_leak(question) or _contains_meta_leak(answer):
+                        continue
+
+                anchor_doc_id = (
+                    chunk.get("doc_id")
+                    if isinstance(chunk.get("doc_id"), str) and chunk.get("doc_id")
+                    else chunk_id.rsplit("_c", 1)[0]
+                )
+                language = (chunk.get("language") or get_semantic_field(chunk, "language") or "unknown")
+                content_types = get_flat_list_field(chunk, "content_type")
+                domains = get_flat_list_field(chunk, "domain")
+                trust_level = (chunk.get("trust_level") or get_semantic_field(chunk, "trust_level") or "missing")
+
+                out_record = {
+                    "id": make_candidate_id(anchor_chunk_id=chunk_id, qa_index=qa_idx, payload=qa_obj),
+                    "anchor_chunk_id": chunk_id,
+                    "anchor_doc_id": anchor_doc_id,
+                    "context_chunks": all_chunk_ids,
+                    "source_chunks": evidence,
+                    "source_refs": evidence_refs,
+                    "context_refs": context_refs,
+                    "doc_ids": list(
+                        dict.fromkeys([c.get("doc_id") for c in context_group if isinstance(c.get("doc_id"), str)])
+                    ),
+                    "question": question,
+                    "answer": answer,
+                    "difficulty": difficulty,
+                    "language": language,
+                    "content_type": content_types,
+                    "domain": domains,
+                    "trust_level": trust_level,
+                    "workspace_file": in_path.name,
+                    "provenance": {
+                        "faiss": {
+                            "metric": metric_info.metric,
+                            "index_type": metric_info.index_type,
+                            "normalized": metric_info.normalized,
+                            "neighbor_chunk_ids": faiss_neighbor_ids,
+                            "neighbor_scores": faiss_neighbor_scores,
+                        },
+                        "local_neighbor_chunk_ids": local_neighbor_ids,
+                        "config_hash": config_hash,
+                        "prompts": {
+                            "double_pass": True,
+                            "plan_system_hash": plan_system_hash,
+                            "plan_user_hash": plan_user_hash,
+                            "gen_system_hash": gen_system_hash,
+                            "gen_user_hash": gen_user_hash,
+                        },
+                        "system_prompt_hash": system_prompt_hash,
+                        "user_template_hash": user_template_hash,
+                        "llm": {
+                            "backend": backend,
+                            "model": model,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "num_ctx": num_ctx,
+                            "max_tokens_generate": max_tokens,
+                            "max_tokens_plan": plan_max_tokens,
+                        },
+                        "plan": {
+                            "equations_present": bool(plan_obj.get("equations_present")),
+                            "equation_quotes": plan_obj.get("equation_quotes", []),
+                            "generator_checks": plan_obj.get("generator_checks", []),
+                            "takeaways": plan_obj.get("takeaways", []),
+                        },
+                    },
+                }
+
+                out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
+                written_for_group += 1
+                total_written += 1
+
+                if remaining_qa_for_document is not None:
+                    remaining_qa_for_document -= 1
+                    if remaining_qa_for_document <= 0:
+                        break
+
+                if isinstance(global_state.get("remaining_global"), int):
+                    global_state["remaining_global"] -= 1
+                    if global_state["remaining_global"] <= 0:
+                        break
+
+            if written_for_group > 0:
+                written_any_for_chunk += written_for_group
+
+            if total_written and (total_written % max(1, log_every) == 0):
+                logging.info(
+                    "Zwischenstand %s: %d Q/A-Paare aus %d Gruppen (attempted).",
+                    in_path.name,
+                    total_written,
+                    total_groups,
+                )
+
+        if written_any_for_chunk > 0:
+            processed_set.add(chunk_id)
 
         if isinstance(global_state.get("remaining_global"), int) and global_state["remaining_global"] <= 0:
             break
-
-        if max_groups_per_chunk and num_groups_for_chunk >= max_groups_per_chunk:
-            continue
 
     out_f.close()
 
@@ -1080,6 +1117,110 @@ def process_semantic_file(
         total_groups,
     )
     return total_written
+
+def build_context_groups(
+    candidate: Dict[str, Any],
+    local_neighbors: Sequence[Dict[str, Any]],
+    faiss_neighbors: Sequence[Dict[str, Any]],
+    cfg: QAConfig,
+    max_groups_per_chunk: int,
+) -> List[List[Dict[str, Any]]]:
+    """
+    Create MULTIPLE context groups per anchor chunk by slicing FAISS neighbors into
+    batches that fit into grouping.max_group_size.
+
+    Always includes:
+      - candidate (anchor)
+      - local neighbors (before/after)
+    Then adds FAISS neighbors in windows.
+
+    This makes max_groups_per_chunk actually meaningful.
+    """
+    grouping = cfg.grouping
+    min_group_size = int(grouping.get("min_group_size", 2))
+    max_group_size = int(grouping.get("max_group_size", 6))
+
+    seen_ids: set[str] = set()
+
+    def slim_chunk(ch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cid = str(ch.get("chunk_id"))
+        if not cid or cid in seen_ids:
+            return None
+        seen_ids.add(cid)
+
+        summary_short = get_semantic_field(ch, "summary_short")
+        if not isinstance(summary_short, str):
+            summary_short = None
+
+        return {
+            "chunk_id": cid,
+            "doc_id": ch.get("doc_id"),
+            "language": ch.get("language"),
+            "trust_level": get_semantic_field(ch, "trust_level"),
+            "content_type": get_flat_list_field(ch, "content_type"),
+            "domain": get_flat_list_field(ch, "domain"),
+            "summary_short": summary_short,
+            "content": ch.get("content"),
+        }
+
+    # Base always included
+    base: List[Dict[str, Any]] = []
+    c0 = slim_chunk(candidate)
+    if c0:
+        base.append(c0)
+
+    for ch in local_neighbors:
+        s = slim_chunk(ch)
+        if s:
+            base.append(s)
+
+    # Slim all FAISS neighbors (unique)
+    faiss_slim: List[Dict[str, Any]] = []
+    for ch in faiss_neighbors:
+        s = slim_chunk(ch)
+        if s:
+            faiss_slim.append(s)
+
+    # Ensure we can reach min_group_size
+    if len(base) >= min_group_size:
+        base_prefilled = list(base)
+        start_idx = 0
+    else:
+        need = min_group_size - len(base)
+        if len(faiss_slim) < need:
+            return []
+        base_prefilled = list(base) + faiss_slim[:need]
+        start_idx = need
+
+    # Cap base to max_group_size (edge case)
+    if len(base_prefilled) > max_group_size:
+        base_prefilled = base_prefilled[:max_group_size]
+
+    remaining_slots = max_group_size - len(base_prefilled)
+
+    groups: List[List[Dict[str, Any]]] = []
+
+    if remaining_slots <= 0 or start_idx >= len(faiss_slim):
+        groups.append(base_prefilled)
+        if max_groups_per_chunk > 0:
+            groups = groups[:max_groups_per_chunk]
+        return groups
+
+    # Create multiple groups by windowing remaining FAISS neighbors
+    i = start_idx
+    while i < len(faiss_slim):
+        g = base_prefilled + faiss_slim[i : i + remaining_slots]
+        if len(g) >= min_group_size:
+            groups.append(g)
+        i += remaining_slots
+
+        if max_groups_per_chunk > 0 and len(groups) >= max_groups_per_chunk:
+            break
+
+    if not groups:
+        groups = [base_prefilled]
+
+    return groups
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1146,6 +1287,16 @@ def load_qa_config(config_path: Optional[str]) -> QAConfig:
     raw = load_json(path)
     return QAConfig(raw=raw, config_path=path)
 
+def iter_semantic_files(semantic_dir: Path, limit_num_files: int = 0) -> Iterator[Path]:
+    """
+    Yields *.jsonl files from semantic_dir (sorted for determinism).
+    limit_num_files <= 0 means: no limit.
+    """
+    files = sorted(semantic_dir.glob("*.jsonl"))
+    if limit_num_files and limit_num_files > 0:
+        files = files[:limit_num_files]
+    for p in files:
+        yield p
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)

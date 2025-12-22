@@ -7,6 +7,7 @@
     "faiss_index": "indices/faiss/contextual.index",
     "faiss_meta": "indices/faiss/contextual_meta.jsonl",
     "qa_candidates": "qa_candidates/jsonl",
-    "qa_final": "qa_final/jsonl"
+    "qa_final": "qa_final/jsonl",
+    "prompts_json": "config/qa/prompts.json"
   }
 }

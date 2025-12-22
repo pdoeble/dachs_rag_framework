@@ -53,7 +53,7 @@
       "per_100k_chars": 4.0
     },
 
-    "global_qa_limit": 60000,
+    "global_qa_limit": 200,
     "sampling_strategy": "sequential"
   },
 
@@ -72,7 +72,7 @@
   "runtime": {
     "num_workers": 1,
     "shuffle_files": true,
-    "resume_mode": "append",
+    "resume_mode": "overwrite",
     "dry_run": false,
 
     "log_level": "INFO",
@@ -88,12 +88,12 @@
     "qa_schema_version": "v1",
     "include_source_text": false,
     "include_semantic_tags": true,
-    "output_file_pattern": "{input_basename}.qa_candidates.jsonl"
+    "output_file_pattern": "{input_basename}.qa_candidates.TEST.jsonl"
   },
 
   "debug": {
-    "limit_num_files": 0,
-    "limit_num_chunks": 0,
+    "limit_num_files": 1,
+    "limit_num_chunks": 20,
 
     "dump_example_prompts": false,
     "example_prompts_dir": "logs/qa_prompts"

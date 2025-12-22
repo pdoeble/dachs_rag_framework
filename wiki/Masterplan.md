@@ -1156,136 +1156,171 @@ Um LLM-Kapazität nicht an layoutbedingte Fragmente zu verschwenden und die Stat
 5. **Konsistente LLM-Regeln für nicht-informative Chunks**  
    Der System-Prompt des LLM enthält zusätzlich die Vorgabe, für klar nicht-informative MAIN CHUNKS (kurzer/leerzeichendominierter Text, nur Zahlen/Interpunktion) leere Taxonomie-Listen, `language = "unknown"`, `trust_level = "low"` und `summary_short = ""` zurückzugeben und keine Semantik zu halluzinieren. In Kombination mit dem Pre-Filter (1) sorgt das für robuste, deterministische Behandlung von Layout-Fragmenten.
 
-## 6.3 Generierung von Q/A-Kandidaten (aktualisiert, FAISS-basiert)
-
-Die Q/A-Kandidaten-Generierung (`scripts/generate_qa_candidates.py`) nutzt semantisch annotierte Chunks aus
-
-```text
-semantic/json/
-```
-
-und erzeugt daraus erste Frage–Antwort-Paare als **Roh-Kandidaten**, die anschließend durch Filter-/Merge-Schritte bereinigt und zu einem finalen Trainingsdatensatz zusammengeführt werden.
-
-Der Schritt arbeitet strikt **workspace-lokal**:
-
-- Input: `semantic/json/*.jsonl` (oder `.json`)
-- Output: `qa_candidates/jsonl/*.jsonl`
-- Kontext: globaler Chunk-Kontextindex unter `indices/faiss/` (geladen über `FaissRetriever`)
+## 6.3 Generierung von Q/A-Kandidaten (Double-Pass, FAISS-basiert)
 
 ### 6.3.1 Überblick (Kernidee)
 
-Für jeden geeigneten Anker-Chunk `C`:
+Für jeden geeigneten **Anker-Chunk** `C` (nach Filters) wird **mehr als ein Kontextfenster** gebaut und pro Kontextfenster ein **Double-Pass** gefahren:
 
-1. Kandidatenfilter anwenden (Sprache, Trust-Level, Content-Type, Mindesttextlänge, ggf. Artefaktrollen).
-2. Kontextgruppe bilden:
-   - lokale Nachbarn im Dokument (vor/nach `C`),
-   - semantische Nachbarn über FAISS (k-NN in Chunk-Embedding-Space),
-   - Deduplizieren und auf `min_group_size`/`max_group_size` begrenzen.
-3. LLM mit der Kontextgruppe prompten und **mehrere** Q/A-Paare erzeugen.
-4. Streng als JSON-Array parsen und als JSONL schreiben (resume-fähig pro Eingabedatei).
+1. **Kandidatenfilter**  
+   - Sprache, Trust-Level, Content-Type, Mindestlänge, ggf. weitere semantische Regeln (konfigurierbar).
 
-### 6.3.2 Kontextgruppenbildung (lokal + FAISS)
+2. **Kontextgruppenbildung (mehrere Gruppen pro Chunk)**  
+   - `C` ist immer enthalten.  
+   - Lokale Nachbarn (vor/nach `C`) stabilisieren Dokumentkohärenz.  
+   - FAISS liefert semantische Nachbarn; die Liste wird gefiltert und **in Batches** gesliced, um **mehrere Kontextgruppen** zu erzeugen.  
+   - Limit über `sampling.max_groups_per_chunk`.
+
+3. **LLM Double-Pass pro Kontextgruppe**
+   - **PASS 1 (PLAN):** Modell muss ein *kleines* Plan-JSON erzeugen (2 explizite Takeaways, Equation-Check, Generator-Checks).  
+     → Wenn Plan ungültig oder nicht strikt JSON: Gruppe wird verworfen.
+   - **PASS 2 (GENERATE):** Modell erzeugt bis zu `sampling.max_qa_per_group` Q/A-Paare, nutzt `{PLAN_JSON}` nur als „Gedankenstütze“.  
+     → Output muss strikt ein JSON-Array sein; sonst Drop.
+
+4. **Strikte Validierung + Schreiben als JSONL**  
+   - Pro Q/A ein JSONL-Record (resume-fähig).  
+   - Evidence-Chunks müssen eine Teilmenge der Kontext-Chunk-IDs sein.  
+   - Meta-Leaks (FAISS, doc_id, chunk_id, Pfade, „in this text…“) werden optional gedroppt (`runtime.grounding_drop_if_meta_leak`).
+
+Wichtig: Durch Double-Pass und mehrere Gruppen pro Chunk steigt die Zahl der LLM-Aufrufe deutlich (≈ `2 * num_groups`). Entsprechend müssen **Walltime** und ggf. **global_qa_limit** dimensioniert werden.
+
+---
+
+### 6.3.2 Kontextgruppenbildung (lokal + FAISS, Multi-Group)
+
+**Ziel:** pro Anker-Chunk mehrere „saubere“ Kontextfenster erzeugen, ohne die Kontextgrenzen zu sprengen.
 
 1) **Lokale Nachbarn**  
-Um Dokumentkohärenz zu erhöhen, werden Chunks direkt vor/nach `C` ergänzt (konfigurierbar, z. B. 1 vor + 1 nach).
+- Konfigurierbar über `neighbors.max_local_neighbors_before/after`.  
+- Werden immer zusammen mit `C` in jede Kontextgruppe aufgenommen.
 
-2) **Semantische Nachbarn über FAISS**  
-Der Retriever wird wie folgt genutzt:
+2) **FAISS Nachbarn (semantisch)**  
+- Retrieval: `top_k_faiss` Nachbarn (Chunk-Embedding Space).  
+- Score-Interpretation hängt vom Index ab:  
+  - `IndexFlatIP` / `metric=IP`: **höher = besser**  
+  - `IndexFlatL2` / `metric=L2`: **kleiner = besser**  
+- Filter: Sprache/Trust/Content-Type/Domain, Score-Threshold, Dedupe, Limit `neighbors.max_neighbors`.
 
-```python
-neighbors = retriever.get_neighbors_for_chunk(
-    chunk_id_or_uid=C["chunk_id"],
-    top_k=TOP_K,
-    include_self=False,
-)
+3) **Multi-Group Slicing (max_groups_per_chunk)**  
+- Nach Filter+Sortierung wird die FAISS-Nachbarliste **in Batches** gesliced.  
+- Jeder Batch erzeugt eine eigene Kontextgruppe:  
+  `group = [C] + local_neighbors + batch_neighbors`  
+- Batch-Größe wird durch `grouping.max_group_size` begrenzt.  
+- Maximal werden `sampling.max_groups_per_chunk` Gruppen erzeugt.
+
+4) **Kontext-Budgets beim Prompt-Rendern**  
+- `grouping.max_chars_per_chunk`: pro Chunk wird Text abgeschnitten.  
+- `grouping.max_total_context_chars`: Gesamtbudget pro Kontextfenster.  
+Damit bleibt das Prompt-Fenster stabil, auch wenn große Nachbarlisten existieren.
+
+---
+
+### 6.3.3 Prompts (prompts.json) und Output-Formate (Double-Pass)
+
+Die Prompts liegen zentral in:
+
+```text
+config/qa/prompts.json
 ```
 
-Jeder Nachbar enthält u. a.:
+Diese Datei enthält **zwei** Prompt-Paare (system/user) mit Platzhaltern:
+- `{CONTEXT}` – gerenderte Kontextgruppe
+- `{MAX_QA_PER_GROUP}` – gewünschte Menge pro Generate-Pass
+- `{PLAN_JSON}` – Plan-Resultat aus Pass 1 (nur als Guidance)
 
-- `chunk_id`, optional `chunk_uid`, `doc_id`, `source_path`, `language`,
-- kompletten `semantic`-Block (falls in den Metadaten enthalten),
-- Convenience-Felder (`trust_level`, `content_type`, `domain`) falls vorhanden,
-- `score` (Rohwert aus FAISS `index.search()`).
+#### PASS 1: PLAN (Schema)
 
-**Wichtig: Score-Richtung / Metrik**  
-Die Interpretation von `score` (Ähnlichkeit vs. Distanz) ist **indexabhängig** und muss aus
-`indices/faiss/contextual_config.json` abgeleitet werden (siehe Abschnitt 6.5.3):
-
-- `metric == "IP"` / `IndexFlatIP`: **höher = besser**
-- `metric == "L2"` / `IndexFlatL2`: **kleiner = besser**
-
-Filter (Threshold) und Sortierung dürfen daher nicht hardcoded sein.
-
-3) **Nachbarn filtern**  
-Beispiele für Filterlogik:
-
-- nur erlaubte Sprachen,
-- nur zulässige `trust_level`,
-- nur erlaubte `content_type`,
-- optional `artifact_role`-Ausschluss (z. B. rein strukturelle Chunks),
-- Domain-Overlap (wenn Domain bekannt),
-- Score-Threshold (mit korrekter Richtung aus der Index-Metrik),
-- Begrenzung auf `max_neighbors` (z. B. 8).
-
-### 6.3.3 LLM-Prompt und Ausgabeformat
-
-Die Prompts werden bevorzugt aus Dateien geladen:
-
-- `config/prompts/qa_generation_system.txt`
-- `config/prompts/qa_generation_user.txt`
-
-Falls diese Dateien fehlen, nutzt das Skript interne Defaults.
-
-**Anforderungen an den Default-Prompt (Dataset-Factory-Qualität):**
-
-- Striktes Grounding: nur Information aus den Chunks, keine externen Ergänzungen.
-- Skip-Regel: Wenn kein vollständig belegbares Q/A erzeugbar ist, muss das Modell `[]` zurückgeben.
-- Diversity: bei mehreren Q/A pro Gruppe keine Near-Duplicates.
-- Längenlimits: kurze, trainierbare Q/A (Frage max. ~2 Sätze, Antwort kompakt).
-- Output streng maschinenlesbar: JSON-Array, exakt definierte Keys.
-
-**Output-Schema des LLM (Top-Level-Array):**
+Output muss strikt **ein JSON-Array mit genau einem Objekt** sein:
 
 ```json
 [
-  {"question": "...", "answer": "...", "difficulty": "intermediate"},
-  {"question": "...", "answer": "...", "difficulty": "advanced"}
+  {
+    "takeaways": [
+      {"takeaway": "...", "evidence_chunks": ["chunkA", "chunkB"]},
+      {"takeaway": "...", "evidence_chunks": ["chunkC"]}
+    ],
+    "equations_present": true,
+    "equation_quotes": ["..."],
+    "generator_checks": ["..."]
+  }
 ]
 ```
 
-`generate_qa_candidates.py` extrahiert dieses Array (auch wenn die Antwort „drumherum“ Text enthält), validiert Minimalanforderungen und schreibt pro Element einen Q/A-Kandidaten-Datensatz.
+Hard-fail: Wenn nicht 2 explizite Takeaways gefunden werden → `[]`.
 
-### 6.3.4 Output (JSONL) und Provenance
+#### PASS 2: GENERATE (Schema)
 
-Pro Zeile in `qa_candidates/jsonl/*.jsonl`:
+Output muss strikt ein JSON-Array sein. Jedes Element muss exakt enthalten:
 
+```json
+[
+  {
+    "question": "...",
+    "answer": "...",
+    "difficulty": "basic|intermediate|advanced",
+    "evidence_chunks": ["chunkA", "chunkB"]
+  }
+]
+```
+
+- `evidence_chunks` ist verpflichtend und muss eine Teilmenge der gelieferten Chunk-Labels sein.  
+- In **question/answer** dürfen keine Chunk-IDs/Metadaten erwähnt werden.
+
+---
+
+### 6.3.4 Output (JSONL) und Provenance (Double-Pass)
+
+Pro Zeile in `qa_candidates/jsonl/*.jsonl` (ein Q/A-Datensatz):
+
+**Kernfelder**
+- `id` (deterministisch; stabil bei Merge)
 - `anchor_chunk_id`, `anchor_doc_id`
-- `source_chunks` (Chunk-IDs der Kontextgruppe)
 - `question`, `answer`, `difficulty`
-- zentrale Semantikfelder (z. B. `language`, `content_type`, `domain`, `trust_level`)
+- `context_chunks` (alle Chunk-IDs im Kontextfenster)
+- `source_chunks` (Evidence-Chunk-IDs aus `evidence_chunks`)
 - `workspace_file` (Inputdatei)
 
-**ID-Strategie (robust beim Merge):**  
-Eindeutige IDs sollten deterministisch aus Inhalt/Anker abgeleitet werden (z. B. `anchor_chunk_id` + Hash über `question+answer`), um Kollisionen bei späterem Merge zu vermeiden.
+**Referenzen**
+- `context_refs`: Liste von `make_source_ref(...)` je Kontext-Chunk  
+- `source_refs`: subset passend zu `source_chunks`  
+Typische Felder: `chunk_id`, `doc_id`, `source_path`, `title`, `page_start`, `page_end`.
 
-**Empfohlene Provenance (Debugbarkeit):**  
-Optional werden technische Provenance-Daten mitgeschrieben, z. B.:
+**Semantik**
+- `language`, `content_type`, `domain`, `trust_level`
+- `doc_ids` (aus Kontextgruppe, dedupliziert)
 
-- FAISS-Metrik (`metric`, `index_type`, `normalized`),
-- IDs/Score-Liste der FAISS-Nachbarn (nach Filter),
-- lokale Nachbar-IDs,
-- Hash der aktiven Config und Prompts,
-- LLM-Parameter (Modell, Temperature, `max_tokens`).
+**Provenance (empfohlen/implementiert)**
+- `provenance.faiss`: `metric`, `index_type`, `normalized`, `neighbor_chunk_ids`, `neighbor_scores`
+- `provenance.local_neighbor_chunk_ids`
+- `provenance.config_hash`
+- `provenance.prompts`:  
+  - `double_pass: true`  
+  - Hashes: `plan_system_hash`, `plan_user_hash`, `gen_system_hash`, `gen_user_hash`
+  - Legacy-Kompatibilität: `system_prompt_hash` / `user_template_hash` zeigen auf **Generate**.
+- `provenance.llm`: `backend`, `model`, `temperature`, `top_p`, `num_ctx`, `max_tokens_generate`, `max_tokens_plan`
+- `provenance.plan`: gespeicherter Plan (Takeaways + Equation-Flags/Quotes/Checks) für Debug/Traceability
 
-Damit lässt sich später nachvollziehen, *warum* ein Sample entstanden ist (und wie man systematisch verbessert).
+Damit ist Nachvollziehbarkeit gegeben: *welcher Kontext*, *welche Nachbarn*, *welcher Prompt-Stand*, *welcher Plan*, *welche Evidence-Chunks*.
+
+---
 
 ### 6.3.5 LLM-Backend (Ollama) und Robustheit
 
-Das Skript nutzt standardmäßig das Ollama-Chat-API (`/api/chat`) über HTTP.
+- Backend: Ollama Chat API `/api/chat`
+- Endpoint steuerbar über `OLLAMA_API_URL` (z. B. pro SLURM-Task eigener Port).
+- Token-/Kontextsteuerung:
+  - `max_tokens` → Ollama `options.num_predict`
+  - `num_ctx` → Ollama `options.num_ctx` (falls > 0)
+  - `plan_max_tokens` getrennt für Pass 1 (kleineres Budget, schneller/robuster)
 
-- `max_tokens` wird in Ollama über `options.num_predict` begrenzt.
-- Für Stabilität werden `max_retries` und `retry_backoff_s` unterstützt (Retry + Exponential Backoff).
-- Bei Parse-/HTTP-Fehlern wird das jeweilige Sample übersprungen (Logging).
+Robustheit:
+- `max_retries` + `retry_backoff_s` (exponentiell, jitter)
+- Harte Parser-Regel: LLM muss JSON-Array liefern; sonst Drop der Gruppe (PLAN) bzw. Drop des Samples (GENERATE).
+- Logging unterscheidet klar:
+  - `LLM-PLAN-Aufruf ... fehlgeschlagen`
+  - `LLM-GENERATE-Aufruf ... fehlgeschlagen`
+
+---
 
 ### 6.3.6 Konfiguration und CLI von `generate_qa_candidates.py`
 
@@ -1295,88 +1330,55 @@ Gesteuert über:
 config/qa/qa_generation.default.json
 ```
 
-Relevante (typische) Schlüssel:
+Wichtige Schlüssel (aktueller Stand):
 
-- `paths`:
-  - `workspace_root`, `semantic_dir`, `qa_candidates_dir`,
-  - `prompt_system_file`, `prompt_user_template_file`
-- `filters`:
-  - `languages_allowed`, `trust_levels_allowed`, `content_types_allowed`,
-  - optional: `artifact_roles_excluded`, `min_content_chars`
-- `neighbors`:
-  - `top_k_faiss`, `max_neighbors`,
-  - `similarity_threshold` (Achtung: Interpretation hängt von Indexmetrik ab),
-  - `max_local_neighbors_before`, `max_local_neighbors_after`
-- `grouping`:
-  - `min_group_size`, `max_group_size`,
-  - optional: `max_chars_per_chunk`, `max_total_context_chars`
+- `filters`: erlaubte Sprachen/Trust-Level/Content-Type, Mindestlänge etc.
+- `neighbors`: `top_k_faiss`, `max_neighbors`, Threshold, lokale Nachbarn vor/nach
+- `grouping`: `max_group_size`, `max_chars_per_chunk`, `max_total_context_chars`
 - `sampling`:
-  - `max_qa_per_group`, `max_groups_per_chunk`,
-  - `max_qa_per_document`, `global_qa_limit`
-- `llm`:
-  - `backend`, `model`, `temperature`, `top_p`, `max_tokens`,
-  - `request_timeout_s`, optional: `max_retries`, `retry_backoff_s`
-- `runtime`:
-  - `resume_mode` (`append|resume|overwrite`), `log_level`,
-  - `dry_run`, `log_every_n_examples`
-- `debug`:
-  - `limit_num_files`, `limit_num_chunks`
+  - `max_qa_per_group` (Generate-Ausbeute pro Kontextfenster)
+  - `max_groups_per_chunk` (wie viele Kontextfenster pro Anchor-Chunk)
+  - `max_qa_per_document` (cap, ggf. adaptive)
+  - `global_qa_limit` (harte Obergrenze)
+- `llm`: `model`, `temperature`, `top_p`, `max_tokens`, `plan_max_tokens`, `num_ctx`, `request_timeout_s`, retries
+- `runtime`: `resume_mode` (`append`/`overwrite`), `dry_run`, `log_level`
+- `debug`: `limit_num_files`, `limit_num_chunks`
 
-**Beispiele:**
+Prompts werden aus `config/qa/prompts.json` geladen (Double-Pass).
+
+**CLI Beispiele**
 
 ```bash
 cd ~/dachs_rag_framework
 python scripts/generate_qa_candidates.py
 ```
 
-Expliziter Workspace + reduzierte Dateianzahl, explizite Config:
-
+Explizite Config + Testlauf (klein):
 ```bash
-python scripts/generate_qa_candidates.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --config config/qa/qa_generation.default.json   --limit-num-files 3   --log-level DEBUG
+python scripts/generate_qa_candidates.py   --config config/qa/qa_generation.test.json   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --num-shards 1   --shard-id 0
 ```
-### 6.3.7 HPC/SLURM: Sharding-Run als GPU-Array (wichtig: Ollama-Port pro Task)
 
-Für lineare Skalierung auf mehrere GPUs wird `generate_qa_candidates.py` als SLURM-Array gestartet und per
+---
 
+### 6.3.7 HPC/SLURM: Sharding-Run als GPU-Array (Ollama-Port pro Task)
+
+Sharding:
 - `--num-shards N`
-- `--shard-id i` (0-basiert, typischerweise `SLURM_ARRAY_TASK_ID`)
+- `--shard-id i` (typisch `SLURM_ARRAY_TASK_ID`)
 
-aufgeteilt. Jeder Task verarbeitet einen disjunkten Teil der `semantic/json`-Dateien.
+Multi-GPU Fallstrick: pro Task eigener Ollama-Port (sonst Port-Kollision).
 
-**Kritischer Fallstrick (Multi-GPU Nodes):**  
-Wenn in jedem Array-Task `ollama serve` auf dem Default-Port `127.0.0.1:11434` gestartet wird, kollidieren parallele Tasks auf demselben Node (Port bereits belegt). Deshalb muss **pro Task** ein eigener Port verwendet werden.
+Empfehlung (wie im Jobfile):
+- `OLLAMA_PORT=11434 + SLURM_ARRAY_TASK_ID`
+- `OLLAMA_API_URL="http://127.0.0.1:${OLLAMA_PORT}/api/chat"`
+- Readiness-Loop (`/api/tags`), Model-Tag Check, Warmup
+- `OLLAMA_KEEP_ALIVE=30m` (Performance)
 
-**Empfohlenes Muster:**
+Double-Pass Hinweis: pro Kontextgruppe **2** Requests (PLAN + GENERATE). Entsprechend:
+- Walltime eher großzügig setzen (z. B. volle 24h bei großen Läufen),
+- `global_qa_limit` und `max_groups_per_chunk` bewusst dimensionieren.
 
-- Port pro Task: `OLLAMA_PORT = 11434 + SLURM_ARRAY_TASK_ID`
-- `trap`/Cleanup, damit der Server auch bei Fehlern beendet wird
-- kurzer Readiness-Loop, bevor Python startet
-
-Beispiel (Auszug):
-
-```bash
-#SBATCH --array=0-19%5
-
-OLLAMA_PORT=$((11434 + SLURM_ARRAY_TASK_ID))
-export OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT}"
-export OLLAMA_API_URL="http://127.0.0.1:${OLLAMA_PORT}/api/chat"
-
-ollama serve >/tmp/ollama_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log 2>&1 &
-OLLAMA_PID=$!
-trap 'kill "${OLLAMA_PID}" >/dev/null 2>&1 || true' EXIT
-
-# optional: warten bis /api/tags erreichbar ist
-for _ in $(seq 1 30); do
-  curl -fsS "http://127.0.0.1:${OLLAMA_PORT}/api/tags" >/dev/null 2>&1 && break
-  sleep 1
-done
-
-python scripts/generate_qa_candidates.py   --workspace-root /beegfs/scratch/workspace/es_phdoeble-rag_pipeline   --num-shards 20   --shard-id "${SLURM_ARRAY_TASK_ID}"
-```
-
-**Hinweis zu `global_qa_limit`:**  
-Ein wirklich globales Limit über alle Shards ist ohne Koordination nicht exakt durchsetzbar. In der Sharding-Variante wird ein gesetztes `global_qa_limit` deshalb auf die Shards aufgeteilt (≈ `ceil(limit / num_shards)`), um insgesamt im Zielbereich zu bleiben.
-
+---
 
 ## 6.4 Schritt 6: Qualitätssicherung und Dataset-Build (`qa_candidates/jsonl/ → qa_final/jsonl/`)
 
