@@ -138,44 +138,48 @@ def render_prompt(
 
 
 def parse_plan_output(plan_arr: Any) -> Optional[Dict[str, Any]]:
-    """
-    Expect: JSON array with exactly 1 object:
-    {
-      "takeaways": [ { "takeaway": str, "evidence_chunks": [str,...] }, { ... } ],
-      "equations_present": bool,
-      "equation_quotes": [str, ...],
-      "generator_checks": [str, ...]
-    }
-    Return dict if valid else None.
-    """
-    if not isinstance(plan_arr, list) or len(plan_arr) != 1:
+    # PLAN darf auch leer sein -> dann Default-Plan verwenden
+    if plan_arr == []:
+        return {
+            "takeaways": [],
+            "equations_present": False,
+            "equation_quotes": [],
+            "generator_checks": [],
+        }
+
+    if not isinstance(plan_arr, list) or len(plan_arr) != 1 or not isinstance(plan_arr[0], dict):
         return None
+
     obj = plan_arr[0]
-    if not isinstance(obj, dict):
-        return None
 
     takeaways = obj.get("takeaways")
     if not isinstance(takeaways, list) or len(takeaways) != 2:
         return None
+
     for t in takeaways:
         if not isinstance(t, dict):
             return None
         if not isinstance(t.get("takeaway"), str) or not t["takeaway"].strip():
             return None
         ev = t.get("evidence_chunks")
-        if not isinstance(ev, list) or not ev or not all(isinstance(x, str) and x.strip() for x in ev):
+        if not isinstance(ev, list) or not all(isinstance(x, str) and x.strip() for x in ev):
             return None
 
-    if not isinstance(obj.get("equations_present"), bool):
+    equations_present = bool(obj.get("equations_present", False))
+    equation_quotes = obj.get("equation_quotes", [])
+    generator_checks = obj.get("generator_checks", [])
+
+    if not isinstance(equation_quotes, list) or not all(isinstance(x, str) for x in equation_quotes):
         return None
-    eq = obj.get("equation_quotes")
-    if not isinstance(eq, list) or not all(isinstance(x, str) for x in eq):
-        return None
-    gc = obj.get("generator_checks")
-    if not isinstance(gc, list) or not all(isinstance(x, str) for x in gc):
+    if not isinstance(generator_checks, list) or not all(isinstance(x, str) for x in generator_checks):
         return None
 
-    return obj
+    return {
+        "takeaways": takeaways,
+        "equations_present": equations_present,
+        "equation_quotes": equation_quotes,
+        "generator_checks": generator_checks,
+    }
 
 @dataclass(frozen=True)
 class FaissMetricInfo:
@@ -200,6 +204,10 @@ def load_text(path: Path) -> str:
 def _stable_sha1_16(obj: dict) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+def _preview(s: str, n: int = 900) -> str:
+    s = (s or "").replace("\n", "\\n")
+    return s[:n] + ("…" if len(s) > n else "")
 
 
 def make_candidate_id(anchor_chunk_id: str, qa_index: int, payload: dict) -> str:
@@ -597,6 +605,48 @@ def call_llm_ollama_once(
         raise ValueError("LLM-Output ist kein JSON-Array.")
     return parsed
 
+def call_llm_ollama_once_text(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_s: int,
+    num_ctx: int = 0,
+) -> str:
+    url = os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434/api/chat")
+
+    options = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "num_predict": int(max_tokens),
+    }
+    if int(num_ctx) > 0:
+        options["num_ctx"] = int(num_ctx)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": options,
+    }
+
+    resp = requests.post(url, json=payload, timeout=timeout_s)
+    resp.raise_for_status()
+    data = resp.json()
+
+    message = data.get("message") or {}
+    content = message.get("content") or ""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Ollama-Antwort enthält keinen Text-Content.")
+    
+
+    return content
+
 
 def call_llm_ollama_with_retries(
     system_prompt: str,
@@ -713,7 +763,6 @@ def load_prompt_bundle(cfg: "QAConfig") -> PromptBundle:
         gen_system=gen_system,
         gen_user=gen_user,
     )
-
 def process_semantic_file(
     in_path: Path,
     out_path: Path,
@@ -885,7 +934,7 @@ def process_semantic_file(
                 continue
 
             # --------------------
-            # PASS 1: PLAN
+            # PASS 1: PLAN (RAW TEXT DEBUG)
             # --------------------
             plan_user_prompt = render_prompt(
                 context_group=context_group,
@@ -894,7 +943,7 @@ def process_semantic_file(
             )
 
             try:
-                plan_arr = call_llm_ollama_with_retries(
+                plan_text = call_llm_ollama_once_text(
                     system_prompt=prompts.plan_system,
                     user_prompt=plan_user_prompt,
                     model=model,
@@ -902,25 +951,29 @@ def process_semantic_file(
                     top_p=top_p,
                     max_tokens=plan_max_tokens,
                     timeout_s=timeout_s,
-                    max_retries=max_retries,
-                    retry_backoff_s=retry_backoff_s,
                     num_ctx=num_ctx,
                 )
             except Exception as e:
                 logging.warning(
-                    "LLM-PLAN-Aufruf für chunk_id=%s in %s fehlgeschlagen: %s",
+                    "LLM-PLAN-Aufruf (text) für chunk_id=%s in %s fehlgeschlagen: %s",
                     chunk_id,
                     in_path.name,
                     e,
                 )
                 continue
 
+            try:
+                plan_arr = extract_json_from_text(plan_text)
+            except Exception:
+                plan_arr = None
+
             plan_obj = parse_plan_output(plan_arr)
             if plan_obj is None:
                 logging.warning(
-                    "PLAN-Output ungültig ... für chunk_id=%s in %s -> FALLBACK: generate without plan",
+                    "PLAN ungültig -> FALLBACK (generate without plan) für chunk_id=%s in %s | plan_text=%s",
                     chunk_id,
                     in_path.name,
+                    _preview(plan_text),
                 )
                 plan_obj = {
                     "takeaways": [],
@@ -928,12 +981,19 @@ def process_semantic_file(
                     "equation_quotes": [],
                     "generator_checks": [],
                 }
-                continue
 
             plan_json_str = json.dumps(plan_obj, ensure_ascii=False, separators=(",", ":"))
+            if not global_state.get("_logged_plan_json_preview", False):
+                logging.info(
+                    "PLAN_JSON PREVIEW=%s",
+                    (plan_json_str[:500].replace("\n", "\\n") if isinstance(plan_json_str, str) else "<non-str>"),
+                )
+                global_state["_logged_plan_json_preview"] = True
+
+
 
             # --------------------
-            # PASS 2: GENERATE
+            # PASS 2: GENERATE (RAW TEXT DEBUG)
             # --------------------
             user_prompt = render_prompt(
                 context_group=context_group,
@@ -942,9 +1002,15 @@ def process_semantic_file(
                 plan_json=plan_json_str,
                 cfg=cfg,
             )
+            if not global_state.get("_logged_gen_preview", False):
+                logging.info(
+                    "PROMPT PREVIEW gen_user=%s",
+                    (user_prompt[:800].replace("\n", "\\n") if isinstance(user_prompt, str) else "<non-str>"),
+                )
+                global_state["_logged_gen_preview"] = True
 
             try:
-                qa_list = call_llm_ollama_with_retries(
+                gen_text = call_llm_ollama_once_text(
                     system_prompt=prompts.gen_system,
                     user_prompt=user_prompt,
                     model=model,
@@ -952,20 +1018,44 @@ def process_semantic_file(
                     top_p=top_p,
                     max_tokens=max_tokens,
                     timeout_s=timeout_s,
-                    max_retries=max_retries,
-                    retry_backoff_s=retry_backoff_s,
                     num_ctx=num_ctx,
                 )
             except Exception as e:
                 logging.warning(
-                    "LLM-GENERATE-Aufruf für chunk_id=%s in %s fehlgeschlagen: %s",
+                    "LLM-GENERATE-Aufruf (text) für chunk_id=%s in %s fehlgeschlagen: %s",
                     chunk_id,
                     in_path.name,
                     e,
                 )
                 continue
 
+            try:
+                qa_list = extract_json_from_text(gen_text)
+            except Exception:
+                logging.warning(
+                    "GENERATE kein JSON für chunk_id=%s in %s | gen_text=%s",
+                    chunk_id,
+                    in_path.name,
+                    _preview(gen_text),
+                )
+                continue
+
+            if not isinstance(qa_list, list):
+                logging.warning(
+                    "GENERATE Output ist kein JSON-Array für chunk_id=%s in %s | gen_text=%s",
+                    chunk_id,
+                    in_path.name,
+                    _preview(gen_text),
+                )
+                continue
+
             if not qa_list:
+                logging.info(
+                    "GENERATE hat [] geliefert für chunk_id=%s in %s | gen_text=%s",
+                    chunk_id,
+                    in_path.name,
+                    _preview(gen_text),
+                )
                 continue
 
             written_for_group = 0
@@ -1301,7 +1391,15 @@ def iter_semantic_files(semantic_dir: Path, limit_num_files: int = 0) -> Iterato
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     cfg = load_qa_config(args.config)
-
+    pb = load_prompt_bundle(cfg)
+    logging.info(
+        "PROMPTS hash plan_system=%s plan_user=%s gen_system=%s gen_user=%s",
+        sha1_text(pb.plan_system),
+        sha1_text(pb.plan_user),
+        sha1_text(pb.gen_system),
+        sha1_text(pb.gen_user),
+    )
+    logging.info("OLLAMA_API_URL=%s", os.environ.get("OLLAMA_API_URL"))
     log_level = args.log_level or cfg.runtime.get("log_level") or "INFO"
     setup_logging(log_level)
 

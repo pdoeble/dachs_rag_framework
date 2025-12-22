@@ -43,7 +43,7 @@
 
   "sampling": {
     "max_qa_per_group": 2,
-    "max_groups_per_chunk": 4,
+    "max_groups_per_chunk": 1,
 
     "max_qa_per_document": {
       "mode": "adaptive",
@@ -53,7 +53,7 @@
       "per_100k_chars": 4.0
     },
 
-    "global_qa_limit": 200,
+    "global_qa_limit": 50,
     "sampling_strategy": "sequential"
   },
 
@@ -93,7 +93,7 @@
 
   "debug": {
     "limit_num_files": 1,
-    "limit_num_chunks": 20,
+    "limit_num_chunks": 200,
 
     "dump_example_prompts": false,
     "example_prompts_dir": "logs/qa_prompts"
