@@ -42,9 +42,8 @@ export OLLAMA_API_URL="http://127.0.0.1:${OLLAMA_PORT}/api/chat"
 export NO_PROXY="127.0.0.1,localhost"
 export OLLAMA_KEEP_ALIVE=30m
 
-OLLAMA_LOG="${LOGDIR}/ollama_${SLURM_JOB_ID}_${TASK_ID}.log"
-echo "[JOB] OLLAMA_LOG=${OLLAMA_LOG}"
-
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+OLLAMA_LOG="${LOGDIR}/ollama_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}.log"
 ollama serve >"${OLLAMA_LOG}" 2>&1 &
 OLLAMA_PID=$!
 trap 'kill "${OLLAMA_PID}" >/dev/null 2>&1 || true' EXIT
